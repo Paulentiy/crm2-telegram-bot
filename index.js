@@ -105,7 +105,6 @@ async function getCurrencies(force=false){
   if (!force){ const c = getCache('curr'); if (c) return c; }
   const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!A2:A` });
   let arr = (res.data.values || []).flat().map(v => String(v).trim().toUpperCase()).filter(Boolean);
-  // попытка найти по заголовку, если A2:A пусто
   if (arr.length === 0){
     const hdr = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!1:1` });
     const header = (hdr.data.values?.[0] || []).map(s => String(s).trim().toLowerCase());
@@ -135,20 +134,33 @@ async function getRatesMap(){
   return map;
 }
 
-/** ====== AUTOFIX ====== **/
+/** ====== AUTOFIX & VALIDATION ====== **/
 async function normalizeType(raw){
   const types = await getTypes();
   const t = String(raw||'').trim();
   const found = types.find(x => x.toLowerCase() === t.toLowerCase());
   return found || (t ? (t[0].toUpperCase() + t.slice(1).toLowerCase()) : t);
 }
-function normalizeCurr(raw){
-  return String(raw||'').trim().toUpperCase();
-}
-function normalizeDate(raw){
-  const s = String(raw||'').trim();
-  if (!s) return new Date();
-  return parseDDMMYYYY(s);
+function normalizeCurr(raw){ return String(raw||'').trim().toUpperCase(); }
+function normalizeDate(raw){ const s = String(raw||'').trim(); return s ? parseDDMMYYYY(s) : new Date(); }
+
+async function validateRow([date, pay, type, geo, amt, curr]){
+  const types = await getTypes();
+  const currencies = await getCurrencies();
+  const errs = [];
+
+  if (!(date instanceof Date) || isNaN(date.getTime())) errs.push('Некорректная дата');
+  if (!pay) errs.push('Платёжка не может быть пустой');
+
+  const typeOk = types.some(t => t.toLowerCase() === String(type||'').trim().toLowerCase());
+  if (!typeOk) errs.push(`Тип расхода не из списка: «${type}». Допустимо: ${types.join(', ')}`);
+
+  const currClean = String(curr||'').trim().toUpperCase();
+  if (!currencies.includes(currClean)) errs.push(`Валюта не из «Курсы»: «${currClean}». Допустимо: ${currencies.join(', ')}`);
+
+  if (!(Number(amt) > 0)) errs.push('Сумма должна быть > 0');
+
+  if (errs.length) throw new Error(errs.join('\n'));
 }
 
 /** ====== APPEND / UNDO ====== **/
@@ -161,7 +173,6 @@ async function appendExpenseRow(userId, [date, pay, type, geo, amt, curr, commen
     insertDataOption: 'INSERT_ROWS',
     requestBody: { values }
   });
-  // row number из updatedRange (например "Расходы!A15:H15")
   const updated = resp.data.updates?.updatedRange || '';
   const m = updated.match(/!(?:[A-Z]+)(\d+):/);
   const rowNumber = m ? Number(m[1]) : null;
@@ -184,30 +195,25 @@ async function undoLastForUser(userId){
     spreadsheetId: SPREADSHEET_ID,
     range: `${SHEET_META}!A:C`
   });
-  const rows = (res.data.values || []).slice(1) // без заголовка
-                 .filter(r => r[0] === String(userId));
+  const rows = (res.data.values || []).slice(1).filter(r => r[0] === String(userId));
   if (!rows.length) return { ok:false, reason:'Нет записей для отмены.' };
 
-  // берём последнюю запись пользователя
   const last = rows[rows.length - 1];
   const rowNumber = Number(last[1] || 0);
   if (!(rowNumber > 1)) return { ok:false, reason:'Некорректный номер строки.' };
 
-  // Удаляем строку в «Расходы»
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
-    requestBody: {
-      requests: [{
-        deleteDimension: {
-          range: {
-            sheetId: await getSheetIdByTitle(SHEET_EXPENSES),
-            dimension: 'ROWS',
-            startIndex: rowNumber - 1, // 0-based
-            endIndex: rowNumber
-          }
+    requestBody: { requests: [{
+      deleteDimension: {
+        range: {
+          sheetId: await getSheetIdByTitle(SHEET_EXPENSES),
+          dimension: 'ROWS',
+          startIndex: rowNumber - 1,
+          endIndex: rowNumber
         }
-      }]
-    }
+      }
+    }] }
   });
   return { ok:true, row: rowNumber };
 }
@@ -227,40 +233,25 @@ async function loadExpensesAtoG(){
   });
   return res.data.values || [];
 }
-function parseDateCell(s){
-  // ожидаем DD.MM.YYYY
-  try { return parseDDMMYYYY(s); } catch { return null; }
-}
+function parseDateCell(s){ try { return parseDDMMYYYY(s); } catch { return null; } }
 async function sumUSD(start, end){
   const rows = await loadExpensesAtoG();
   const rates = await getRatesMap();
   let sum = 0;
-
   for (const r of rows){
-    const d = parseDateCell(r[0]);
-    if (!d) continue;
+    const d = parseDateCell(r[0]); if (!d) continue;
     if (d < start || d >= end) continue;
-
     const amt = Number(String(r[4]||'').replace(',', '.')) || 0;
     const curr = String(r[5]||'').trim().toUpperCase();
     const usdCell = Number(String(r[6]||'').replace(',', '.')) || NaN;
-
-    if (!isNaN(usdCell)) { sum += usdCell; }
-    else if (amt > 0 && curr){
-      const rate = rates[curr];
-      if (rate > 0) sum += amt * rate;
-    }
+    if (!isNaN(usdCell)) sum += usdCell;
+    else if (amt > 0 && curr && rates[curr] > 0) sum += amt * rates[curr];
   }
   return sum;
 }
-
-function startOfToday(){
-  const d = new Date(); d.setHours(0,0,0,0); return d;
-}
+function startOfToday(){ const d = new Date(); d.setHours(0,0,0,0); return d; }
 function addDays(d, n){ const x = new Date(d); x.setDate(x.getDate()+n); return x; }
-function startOfMonth(){
-  const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1);
-}
+function startOfMonth(){ const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1); }
 
 /** ====== BOT ====== **/
 const bot = new Telegraf(TELEGRAM_TOKEN, { handlerTimeout: 30000 });
@@ -272,14 +263,11 @@ setInterval(() => { const now = Date.now(); for (const [k,t] of seen) if (now-t>
 bot.use((ctx, next) => { const uid = ctx.update?.update_id; if (uid!=null){ if (seen.has(uid)) return; seen.set(uid, Date.now()); } return next(); });
 
 // Главное меню
-async function showMenu(ctx, text = 'Выберите действие:'){
-  return ctx.reply(text, mainKeyboard());
-}
+async function showMenu(ctx, text = 'Выберите действие:'){ return ctx.reply(text, mainKeyboard()); }
 
 bot.start(async (ctx) => { await ctx.reply(HELP_TEXT, mainKeyboard()); });
 bot.help(async (ctx)  => { await ctx.reply(HELP_TEXT, mainKeyboard()); });
 
-// Кнопки верхнего уровня
 bot.hears('📋 Типы', async (ctx) => {
   const types = await getTypes();
   await ctx.reply('Типы расхода:\n• ' + types.join('\n• '), mainKeyboard());
@@ -327,7 +315,6 @@ bot.hears('❌ Отмена ввода', async (ctx) => {
 });
 
 bot.on('text', async (ctx, next) => {
-  // если не в мастере — передаём дальше
   if (!ctx.session?.wiz) return next();
 
   const st = ctx.session.wiz;
@@ -374,7 +361,6 @@ bot.on('text', async (ctx, next) => {
     }
     if (st.step === 'comm'){
       st.data.comm = txt;
-      // финал: добавляем
       const row = [st.data.date, st.data.pay, st.data.type, st.data.geo, st.data.amt, st.data.curr, st.data.comm];
       await validateRow(row);
       const rowNum = await appendExpenseRow(ctx.from.id, row);
@@ -383,7 +369,7 @@ bot.on('text', async (ctx, next) => {
       await ctx.reply(
         '✅ Добавлено:\n' +
         `Дата: ${dd}\nПлатёжка: ${st.data.pay}\nТип: ${st.data.type}\nGEO: ${st.data.geo}\n` +
-        `Сумма: ${st.data.amt}\nВалюта: ${st.data.curr}` + (st.data.comm ? `\nКомментарий: ${st.data.comm}` : '') +
+        `Сумма: ${st.data.amt}\nВалюта: ${st.data.curr}` + (st.data.comm ? `\нКомментарий: ${st.data.comm}` : '') +
         `\n\nСтрока №${rowNum}. Колонка G (USD) посчитается формулой.`,
         mainKeyboard()
       );
@@ -437,9 +423,9 @@ const PORT = process.env.PORT || 3000;
 
   if (WEBHOOK_BASE_URL) {
     const path = '/tg-webhook';
-    app.use(path, (req, res, next) => bot.webhookCallback(path)(req, res, next));
+    app.post(path, express.json(), (req, res) => bot.webhookCallback(path)(req, res));
     await bot.telegram.setWebhook(`${WEBHOOK_BASE_URL}${path}`);
-    app.listen(PORT, () => console.log('Bot via webhook on', PORT));
+    app.listen(PORT, () => console.log('Bot via webhook on', PORT, 'url:', `${WEBHOOK_BASE_URL}${path}`));
   } else {
     await bot.launch(); // long polling
     app.listen(PORT, () => console.log('Bot via long polling on', PORT));
