@@ -1,8 +1,8 @@
 import express from 'express';
-import { Telegraf } from 'telegraf';
+import { Telegraf, Markup, session } from 'telegraf';
 import { google } from 'googleapis';
 
-/** ====== CONFIG FROM ENV ====== **/
+/** ====== ENV ====== **/
 const {
   TELEGRAM_TOKEN,
   SPREADSHEET_ID,
@@ -25,156 +25,402 @@ const auth = new google.auth.JWT(
 const sheets = google.sheets({ version: 'v4', auth });
 
 /** ====== SHEET NAMES ====== **/
-const SHEET_EXPENSES   = 'Расходы';
-const SHEET_TYPES      = 'Справочники';
-const SHEET_RATES      = 'Курсы';
+const SHEET_EXPENSES = 'Расходы';       // A:Дата B:Платёжка C:Тип D:GEO E:Сумма F:Валюта G:USD H:Комментарий
+const SHEET_TYPES    = 'Справочники';   // A2:A — Тип расхода
+const SHEET_RATES    = 'Курсы';         // A: код валюты, B: курс к USD (1 USD = 1)
+const SHEET_META     = 'BotMeta';       // служебный лист: A user_id, B row_number, C ISO ts
 
-/** ====== SIMPLE CACHE ====== **/
+/** ====== SIMPLE CACHE (memory) ====== **/
 const cache = new Map();
 const setCache = (k, v, ms = 10 * 60 * 1000) => cache.set(k, { v, exp: Date.now() + ms });
 const getCache = (k) => { const it = cache.get(k); if (!it || Date.now() > it.exp) { cache.delete(k); return null; } return it.v; };
 
+/** ====== HELP / MENUS ====== **/
+const HELP_TEXT =
+`Привет! Я бот для внесения расходов в CRM2.
+
+Кнопки:
+• ➕ Добавить расход — пошаговый мастер
+• 📊 Статистика — суммы в USD (сегодня/7дн/месяц)
+• ↩️ Отменить последнюю — отмена вашей последней записи
+• 📋 Типы / 💱 Валюты — списки из «Справочники» и «Курсы»
+
+Формат записи (если вручную): 
+/exp Дата; Платёжка; Тип; GEO; Сумма; Валюта; Коммент
+Пример: /exp ; AdvCash; Прокси; UA; 120; USD; тест`;
+
+const mainKeyboard = () =>
+  Markup.keyboard([
+    ['➕ Добавить расход', '📊 Статистика'],
+    ['📋 Типы', '💱 Валюты'],
+    ['↩️ Отменить последнюю', 'ℹ️ Помощь']
+  ]).resize().persistent();
+
+const cancelKeyboard = () =>
+  Markup.keyboard([['❌ Отмена ввода']]).resize();
+
 /** ====== HELPERS ====== **/
 const normCmd = (text) => String(text || '').trim().split(/\s+/)[0].replace(/@[\w_]+$/i, '').toLowerCase();
 
-async function getTypes(force = false) {
-  if (!force) { const c = getCache('types'); if (c) return c; }
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_TYPES}!A2:A` });
-  const types = (res.data.values || []).flat().map(s => String(s).trim()).filter(Boolean);
-  setCache('types', types);
-  return types;
+function ddmmyyyy(d){
+  const dd = String(d.getDate()).padStart(2,'0');
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const yy = d.getFullYear();
+  return `${dd}.${mm}.${yy}`;
+}
+function parseDDMMYYYY(s){
+  const m = String(s||'').trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (!m) throw new Error('Дата должна быть ДД.ММ.ГГГГ или пусто');
+  const d = new Date(+m[3], +m[2]-1, +m[1]);
+  if (isNaN(d.getTime())) throw new Error('Некорректная дата');
+  return d;
 }
 
-async function getCurrencies(force = false) {
-  if (!force) { const c = getCache('curr'); if (c) return c; }
-  let res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!A2:A` });
-  let arr = (res.data.values || []).flat().map(s => String(s).trim().toUpperCase()).filter(Boolean);
-  if (arr.length === 0) {
+async function ensureMetaSheet(){
+  const info = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  const has = (info.data.sheets || []).some(s => s.properties?.title === SHEET_META);
+  if (!has){
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title: SHEET_META } } }] }
+    });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${SHEET_META}!A1:C1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [['user_id','row','ts']] }
+    });
+  }
+}
+
+/** ====== LOOKUPS ====== **/
+async function getTypes(force=false){
+  if (!force){ const c = getCache('types'); if (c) return c; }
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_TYPES}!A2:A` });
+  const arr = (res.data.values || []).flat().map(v => String(v).trim()).filter(Boolean);
+  setCache('types', arr);
+  return arr;
+}
+async function getCurrencies(force=false){
+  if (!force){ const c = getCache('curr'); if (c) return c; }
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!A2:A` });
+  let arr = (res.data.values || []).flat().map(v => String(v).trim().toUpperCase()).filter(Boolean);
+  // попытка найти по заголовку, если A2:A пусто
+  if (arr.length === 0){
     const hdr = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!1:1` });
     const header = (hdr.data.values?.[0] || []).map(s => String(s).trim().toLowerCase());
     const aliases = ['валюта','currency','curr','code','код'];
     const idx = header.findIndex(h => aliases.includes(h));
-    if (idx >= 0) {
+    if (idx >= 0){
       const col = String.fromCharCode('A'.charCodeAt(0) + idx);
       const res2 = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!${col}2:${col}` });
-      arr = (res2.data.values || []).flat().map(s => String(s).trim().toUpperCase()).filter(Boolean);
+      arr = (res2.data.values || []).flat().map(v => String(v).trim().toUpperCase()).filter(Boolean);
     }
   }
   if (arr.length === 0) throw new Error('В «Курсы» нет списка валют. Заполни A2:A (USD, EUR, …).');
   setCache('curr', arr);
   return arr;
 }
+async function getRatesMap(){
+  const c = getCache('rates'); if (c) return c;
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!A2:B` });
+  const map = {};
+  for (const row of (res.data.values || [])){
+    const code = String(row[0]||'').trim().toUpperCase();
+    const rate = Number(String(row[1]||'').replace(',', '.'));
+    if (code) map[code] = rate > 0 ? rate : (code === 'USD' ? 1 : NaN);
+  }
+  if (!map.USD) map.USD = 1;
+  setCache('rates', map);
+  return map;
+}
 
-function parseDDMMYYYY(s) {
-  const m = String(s).trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-  if (!m) throw new Error('Дата должна быть ДД.MM.ГГГГ или пусто');
-  const d = new Date(+m[3], +m[2]-1, +m[1]);
-  if (isNaN(d.getTime())) throw new Error('Некорректная дата');
-  return d;
-}
-function parseExpensePayload(payload) {
-  const p = String(payload||'').split(';').map(s => s.trim());
-  while (p.length < 7) p.push('');
-  const [dateStr, pay, type, geo, amtStr, curr, comment] = p;
-  const date = dateStr ? parseDDMMYYYY(dateStr) : new Date();
-  const amt = Number(String(amtStr||'').replace(',', '.'));
-  if (!(amt > 0)) throw new Error('Сумма должна быть > 0');
-  return [date, pay, type, (geo||'').toUpperCase(), amt, (curr||'').toUpperCase(), comment];
-}
-async function validateRow([, , type, , amt, curr]) {
+/** ====== AUTOFIX ====== **/
+async function normalizeType(raw){
   const types = await getTypes();
-  const currencies = await getCurrencies();
-  const typeOk = types.some(t => t.toLowerCase() === String(type).trim().toLowerCase());
-  const currOk = currencies.includes(String(curr).trim().toUpperCase());
-  const errs = [];
-  if (!typeOk) errs.push(`Тип расхода не из списка: «${type}». Допустимо: ${types.join(', ')}`);
-  if (!currOk) errs.push(`Валюта не из «Курсы»: «${curr}». Допустимо: ${currencies.join(', ')}`);
-  if (!(amt > 0)) errs.push('Сумма должна быть > 0');
-  if (errs.length) throw new Error(errs.join('\n'));
+  const t = String(raw||'').trim();
+  const found = types.find(x => x.toLowerCase() === t.toLowerCase());
+  return found || (t ? (t[0].toUpperCase() + t.slice(1).toLowerCase()) : t);
 }
-function formatDateForSheet(d) {
-  const dd = String(d.getDate()).padStart(2, '0');
-  const mm = String(d.getMonth()+1).padStart(2, '0');
-  const yyyy = d.getFullYear();
-  return `${dd}.${mm}.${yyyy}`;
+function normalizeCurr(raw){
+  return String(raw||'').trim().toUpperCase();
 }
-async function appendExpenseRow([date, pay, type, geo, amt, curr, comment]) {
-  const values = [[ formatDateForSheet(date), pay, type, geo, amt, curr, '', comment ]];
-  await sheets.spreadsheets.values.append({
+function normalizeDate(raw){
+  const s = String(raw||'').trim();
+  if (!s) return new Date();
+  return parseDDMMYYYY(s);
+}
+
+/** ====== APPEND / UNDO ====== **/
+async function appendExpenseRow(userId, [date, pay, type, geo, amt, curr, comment]){
+  const values = [[ ddmmyyyy(date), pay, type, geo, amt, curr, '', comment ]];
+  const resp = await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
     range: `${SHEET_EXPENSES}!A:H`,
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: { values }
   });
+  // row number из updatedRange (например "Расходы!A15:H15")
+  const updated = resp.data.updates?.updatedRange || '';
+  const m = updated.match(/!(?:[A-Z]+)(\d+):/);
+  const rowNumber = m ? Number(m[1]) : null;
+
+  await ensureMetaSheet();
+  if (rowNumber){
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${SHEET_META}!A:C`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[String(userId), rowNumber, new Date().toISOString()]] }
+    });
+  }
+  return rowNumber;
 }
 
-/** ====== TELEGRAM BOT ====== **/
+async function undoLastForUser(userId){
+  await ensureMetaSheet();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_META}!A:C`
+  });
+  const rows = (res.data.values || []).slice(1) // без заголовка
+                 .filter(r => r[0] === String(userId));
+  if (!rows.length) return { ok:false, reason:'Нет записей для отмены.' };
+
+  // берём последнюю запись пользователя
+  const last = rows[rows.length - 1];
+  const rowNumber = Number(last[1] || 0);
+  if (!(rowNumber > 1)) return { ok:false, reason:'Некорректный номер строки.' };
+
+  // Удаляем строку в «Расходы»
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      requests: [{
+        deleteDimension: {
+          range: {
+            sheetId: await getSheetIdByTitle(SHEET_EXPENSES),
+            dimension: 'ROWS',
+            startIndex: rowNumber - 1, // 0-based
+            endIndex: rowNumber
+          }
+        }
+      }]
+    }
+  });
+  return { ok:true, row: rowNumber };
+}
+
+async function getSheetIdByTitle(title){
+  const info = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  const sh = (info.data.sheets || []).find(s => s.properties?.title === title);
+  if (!sh) throw new Error('Нет листа: ' + title);
+  return sh.properties.sheetId;
+}
+
+/** ====== STATS ====== **/
+async function loadExpensesAtoG(){
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_EXPENSES}!A2:G`
+  });
+  return res.data.values || [];
+}
+function parseDateCell(s){
+  // ожидаем DD.MM.YYYY
+  try { return parseDDMMYYYY(s); } catch { return null; }
+}
+async function sumUSD(start, end){
+  const rows = await loadExpensesAtoG();
+  const rates = await getRatesMap();
+  let sum = 0;
+
+  for (const r of rows){
+    const d = parseDateCell(r[0]);
+    if (!d) continue;
+    if (d < start || d >= end) continue;
+
+    const amt = Number(String(r[4]||'').replace(',', '.')) || 0;
+    const curr = String(r[5]||'').trim().toUpperCase();
+    const usdCell = Number(String(r[6]||'').replace(',', '.')) || NaN;
+
+    if (!isNaN(usdCell)) { sum += usdCell; }
+    else if (amt > 0 && curr){
+      const rate = rates[curr];
+      if (rate > 0) sum += amt * rate;
+    }
+  }
+  return sum;
+}
+
+function startOfToday(){
+  const d = new Date(); d.setHours(0,0,0,0); return d;
+}
+function addDays(d, n){ const x = new Date(d); x.setDate(x.getDate()+n); return x; }
+function startOfMonth(){
+  const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1);
+}
+
+/** ====== BOT ====== **/
 const bot = new Telegraf(TELEGRAM_TOKEN, { handlerTimeout: 30000 });
+bot.use(session());
 
-// анти-дубли
-const seen = new Map();
-const seenTTLms = 10 * 60 * 1000;
-setInterval(() => { const now = Date.now(); for (const [k,t] of seen) if (now - t > seenTTLms) seen.delete(k); }, 60000);
+// анти-дубли по update_id
+const seen = new Map(); const seenTTLms = 10*60*1000;
+setInterval(() => { const now = Date.now(); for (const [k,t] of seen) if (now-t>seenTTLms) seen.delete(k); }, 60000);
+bot.use((ctx, next) => { const uid = ctx.update?.update_id; if (uid!=null){ if (seen.has(uid)) return; seen.set(uid, Date.now()); } return next(); });
 
-bot.use(async (ctx, next) => {
-  const uid = ctx.update?.update_id;
-  if (uid != null) { if (seen.has(uid)) return; seen.set(uid, Date.now()); }
-  return next();
+// Главное меню
+async function showMenu(ctx, text = 'Выберите действие:'){
+  return ctx.reply(text, mainKeyboard());
+}
+
+bot.start(async (ctx) => { await ctx.reply(HELP_TEXT, mainKeyboard()); });
+bot.help(async (ctx)  => { await ctx.reply(HELP_TEXT, mainKeyboard()); });
+
+// Кнопки верхнего уровня
+bot.hears('📋 Типы', async (ctx) => {
+  const types = await getTypes();
+  await ctx.reply('Типы расхода:\n• ' + types.join('\n• '), mainKeyboard());
 });
-
-const HELP =
-`Привет! Я бот для внесения расходов в CRM2.
-/exp Дата; Платёжка; Тип; GEO; Сумма; Валюта; Коммент
-Пример: /exp ; AdvCash; Прокси; UA; 120; USD; тест
-/types — типы, /currencies — валюты, /whoami — ваш user_id`;
-
-bot.start((ctx) => ctx.reply(HELP));
-bot.help((ctx) => ctx.reply(HELP));
-bot.command('whoami', (ctx) => ctx.reply(`user_id: ${ctx.from?.id}\nchat_id: ${ctx.chat?.id}`));
-
-bot.command('types', async (ctx) => {
-  const cached = getCache('types_text'); if (cached) return ctx.reply(cached);
-  await ctx.reply('⏳ Получаю список типов…');
-  const types = await getTypes(true);
-  const text = 'Типы расхода:\n• ' + types.join('\n• ');
-  setCache('types_text', text);
-  return ctx.reply(text);
+bot.hears('💱 Валюты', async (ctx) => {
+  try{
+    const curr = await getCurrencies();
+    await ctx.reply('Доступные валюты:\n• ' + curr.join('\n• '), mainKeyboard());
+  }catch(e){
+    await ctx.reply('❌ ' + e.message, mainKeyboard());
+  }
 });
-bot.command('currencies', async (ctx) => {
-  const cached = getCache('curr_text'); if (cached) return ctx.reply(cached);
-  await ctx.reply('⏳ Получаю список валют…');
-  try {
-    const curr = await getCurrencies(true);
-    const text = 'Доступные валюты:\n• ' + curr.join('\n• ');
-    setCache('curr_text', text);
-    return ctx.reply(text);
-  } catch (e) {
-    return ctx.reply('❌ Не удалось получить валюты: ' + e.message);
+bot.hears('📊 Статистика', async (ctx) => {
+  await ctx.reply('Что показать?', Markup.inlineKeyboard([
+    [ Markup.button.callback('📅 Сегодня', 'stats:day') ],
+    [ Markup.button.callback('🗓 7 дней',  'stats:week') ],
+    [ Markup.button.callback('📆 Месяц',  'stats:month') ],
+  ]));
+});
+bot.action('stats:day',  async (ctx) => { await ctx.answerCbQuery(); const s=startOfToday(); const e=addDays(s,1); const x=await sumUSD(s,e); await ctx.editMessageText(`Сумма за сегодня: ${x.toFixed(2)} USD`); });
+bot.action('stats:week', async (ctx) => { await ctx.answerCbQuery(); const e=addDays(startOfToday(),1); const s=addDays(e,-7); const x=await sumUSD(s,e); await ctx.editMessageText(`Сумма за 7 дней: ${x.toFixed(2)} USD`); });
+bot.action('stats:month',async (ctx) => { await ctx.answerCbQuery(); const s=startOfMonth(); const e=addDays(startOfToday(),1); const x=await sumUSD(s,e); await ctx.editMessageText(`Сумма за месяц: ${x.toFixed(2)} USD`); });
+
+bot.hears('↩️ Отменить последнюю', async (ctx) => {
+  try{
+    const r = await undoLastForUser(ctx.from.id);
+    if (r.ok) await ctx.reply(`Удалил строку №${r.row}`, mainKeyboard());
+    else      await ctx.reply('❌ ' + r.reason, mainKeyboard());
+  }catch(e){
+    await ctx.reply('❌ ' + (e.message||e), mainKeyboard());
   }
 });
 
-// /exp … (поддерживает /exp@BotName ...)
+bot.hears('ℹ️ Помощь', async (ctx) => ctx.reply(HELP_TEXT, mainKeyboard()));
+
+// ===== Мастер "Добавить расход" =====
+bot.hears('➕ Добавить расход', async (ctx) => {
+  ctx.session.wiz = { step: 'date', data: {} };
+  await ctx.reply('Дата (ДД.ММ.ГГГГ) или оставь пусто — возьму сегодня', cancelKeyboard());
+});
+
+bot.hears('❌ Отмена ввода', async (ctx) => {
+  ctx.session.wiz = null;
+  await showMenu(ctx, 'Ок, отменил ввод.');
+});
+
+bot.on('text', async (ctx, next) => {
+  // если не в мастере — передаём дальше
+  if (!ctx.session?.wiz) return next();
+
+  const st = ctx.session.wiz;
+  const txt = (ctx.message.text || '').trim();
+
+  try{
+    if (st.step === 'date'){
+      st.data.date = normalizeDate(txt);
+      st.step = 'pay';
+      return ctx.reply('Платёжка (например: AdvCash, Capitalist, Card)', cancelKeyboard());
+    }
+    if (st.step === 'pay'){
+      if (!txt) return ctx.reply('Платёжка не может быть пустой. Введите снова.', cancelKeyboard());
+      st.data.pay = txt;
+      st.step = 'type';
+      const types = await getTypes();
+      const kb = Markup.keyboard([...types.map(t=>[t]), ['❌ Отмена ввода']]).resize().oneTime();
+      return ctx.reply('Тип расхода (выберите из списка или введите):', kb);
+    }
+    if (st.step === 'type'){
+      st.data.type = await normalizeType(txt);
+      st.step = 'geo';
+      return ctx.reply('GEO (две буквы, например UA, KZ, PL)', cancelKeyboard());
+    }
+    if (st.step === 'geo'){
+      if (!txt) return ctx.reply('GEO не может быть пустым.', cancelKeyboard());
+      st.data.geo = txt.toUpperCase();
+      st.step = 'amt';
+      return ctx.reply('Сумма (число, точка/запятая допустимы)', cancelKeyboard());
+    }
+    if (st.step === 'amt'){
+      const n = Number(txt.replace(',', '.'));
+      if (!(n > 0)) return ctx.reply('Сумма должна быть > 0. Введите снова.', cancelKeyboard());
+      st.data.amt = n;
+      st.step = 'curr';
+      const curr = await getCurrencies();
+      const kb = Markup.keyboard([...curr.map(c=>[c]), ['❌ Отмена ввода']]).resize().oneTime();
+      return ctx.reply('Валюта (выберите из списка или введите):', kb);
+    }
+    if (st.step === 'curr'){
+      st.data.curr = normalizeCurr(txt);
+      st.step = 'comm';
+      return ctx.reply('Комментарий (можно пусто):', cancelKeyboard());
+    }
+    if (st.step === 'comm'){
+      st.data.comm = txt;
+      // финал: добавляем
+      const row = [st.data.date, st.data.pay, st.data.type, st.data.geo, st.data.amt, st.data.curr, st.data.comm];
+      await validateRow(row);
+      const rowNum = await appendExpenseRow(ctx.from.id, row);
+      ctx.session.wiz = null;
+      const dd = ddmmyyyy(st.data.date);
+      await ctx.reply(
+        '✅ Добавлено:\n' +
+        `Дата: ${dd}\nПлатёжка: ${st.data.pay}\nТип: ${st.data.type}\nGEO: ${st.data.geo}\n` +
+        `Сумма: ${st.data.amt}\nВалюта: ${st.data.curr}` + (st.data.comm ? `\nКомментарий: ${st.data.comm}` : '') +
+        `\n\nСтрока №${rowNum}. Колонка G (USD) посчитается формулой.`,
+        mainKeyboard()
+      );
+      return;
+    }
+  }catch(e){
+    ctx.session.wiz = null;
+    return ctx.reply('❌ ' + (e.message || e), mainKeyboard());
+  }
+});
+
+// Совместимость: если кто-то всё же пришлёт /exp …
 bot.hears(/^\/exp(?:@[\w_]+)?\s*(.*)$/i, async (ctx) => {
   try {
-    const row = parseExpensePayload(ctx.match?.[1] || '');
+    const p = (ctx.match?.[1] || '').split(';').map(s=>s.trim()); while (p.length<7) p.push('');
+    const [dateStr, pay, typeRaw, geoRaw, amtStr, currRaw, comm] = p;
+    const row = [
+      normalizeDate(dateStr),
+      pay || 'N/A',
+      await normalizeType(typeRaw),
+      String(geoRaw||'').toUpperCase(),
+      Number(String(amtStr||'').replace(',','.')),
+      normalizeCurr(currRaw),
+      comm
+    ];
     await validateRow(row);
-    await appendExpenseRow(row);
-    const [date, pay, type, geo, amt, curr, comment] = row;
-    await ctx.reply(
-      '✅ Добавлено:\n' +
-      `Дата: ${formatDateForSheet(date)}\nПлатёжка: ${pay}\nТип: ${type}\nGEO: ${geo}\nСумма: ${amt}\nВалюта: ${curr}` +
-      (comment ? `\nКомментарий: ${comment}` : '') +
-      '\n\nКолонка G (USD) посчитается формулой.'
-    );
-  } catch (err) {
-    await ctx.reply('❌ ' + err.message + '\nФормат: /exp Дата; Платёжка; Тип; GEO; Сумма; Валюта; Комментарий');
+    await appendExpenseRow(ctx.from.id, row);
+    await ctx.reply('✅ Готово. Запись добавлена.', mainKeyboard());
+  } catch (e) {
+    await ctx.reply('❌ ' + e.message + '\nФормат: /exp Дата; Платёжка; Тип; GEO; Сумма; Валюта; Комментарий', mainKeyboard());
   }
 });
 
-bot.on('text', (ctx) => ctx.reply('Не понял. Попробуй /help'));
+// fallback
+bot.on('text', async (ctx) => showMenu(ctx));
 
-/** ====== WEB SERVER / START ====== **/
+/** ====== START SERVER ====== **/
 const app = express();
 app.get('/health', (_, res) => res.send('ok'));
 const PORT = process.env.PORT || 3000;
@@ -183,11 +429,12 @@ const PORT = process.env.PORT || 3000;
   try {
     await bot.telegram.setMyCommands([
       { command: 'help', description: 'Как пользоваться' },
-      { command: 'types', description: 'Список типов расхода' },
+      { command: 'types', description: 'Список типов' },
       { command: 'currencies', description: 'Список валют' },
       { command: 'whoami', description: 'Показать user_id' }
     ]);
   } catch {}
+
   if (WEBHOOK_BASE_URL) {
     const path = '/tg-webhook';
     app.use(path, (req, res, next) => bot.webhookCallback(path)(req, res, next));
