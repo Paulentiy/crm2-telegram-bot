@@ -1,5 +1,5 @@
 import express from 'express';
-import { Telegraf, Markup, session } from 'telegraf';
+import { Telegraf, Markup } from 'telegraf';
 import { google } from 'googleapis';
 
 /** ====== ENV ====== **/
@@ -34,6 +34,13 @@ const SHEET_META     = 'BotMeta';
 const cache = new Map();
 const setCache = (k, v, ms = 10 * 60 * 1000) => cache.set(k, { v, exp: Date.now() + ms });
 const getCache = (k) => { const it = cache.get(k); if (!it || Date.now() > it.exp) { cache.delete(k); return null; } return it.v; };
+
+/** ====== WIZARD STATE (вместо ctx.session) ====== **/
+const wizards = new Map(); // key -> { step, data }
+const key = (ctx) => String(ctx.chat?.id ?? ctx.from?.id);
+const getWiz   = (ctx) => wizards.get(key(ctx));
+const setWiz   = (ctx, w) => wizards.set(key(ctx), w);
+const clearWiz = (ctx) => wizards.delete(key(ctx));
 
 /** ====== TEXTS & KEYBOARDS ====== **/
 const HELP_TEXT =
@@ -203,21 +210,15 @@ const startOfMonth=()=>{ const d=new Date(); return new Date(d.getFullYear(), d.
 /** ====== BOT ====== **/
 const bot = new Telegraf(TELEGRAM_TOKEN, { handlerTimeout: 30000 });
 
-/* 1) Поля сессии — полифилл (гарантируем ctx.session) */
-bot.use((ctx, next) => { if (!ctx.session) ctx.session = {}; return next(); });
-
-/* 2) Если доступен telegraf/session — подключим тоже */
-try { bot.use(session()); } catch { /* ok */ }
-
-/* Лог входящих текстов для диагностики */
+// Логи входящих текстов
 bot.on('text', (ctx, next) => { console.log('TEXT:', ctx.message.text); return next(); });
 
-/* Анти-дубли по update_id */
+// Анти-дубли по update_id
 const seen=new Map(); const seenTTL=10*60*1000;
 setInterval(()=>{ const now=Date.now(); for(const [k,t] of seen){ if(now-t>seenTTL) seen.delete(k); }},60000);
 bot.use((ctx,next)=>{ const id=ctx.update?.update_id; if(id!=null){ if(seen.has(id)) return; seen.set(id,Date.now()); } return next(); });
 
-/* Меню/команды */
+// Меню/команды
 const showMenu=(ctx,text='Выберите действие:')=>ctx.reply(text,mainKeyboard());
 bot.start(ctx=>ctx.reply(HELP_TEXT,mainKeyboard()));
 bot.help (ctx=>ctx.reply(HELP_TEXT,mainKeyboard()));
@@ -247,31 +248,33 @@ bot.hears(RX_UNDO, async ctx=>{
 });
 bot.hears(RX_HELP,  ctx=>ctx.reply(HELP_TEXT, mainKeyboard()));
 
-/* ===== Мастер «Добавить расход» ===== */
+/* ===== Мастер «Добавить расход» (на Map, без ctx.session) ===== */
 bot.hears(RX_ADD, async ctx=>{
-  ctx.session.wiz = { step:'date', data:{} };
+  setWiz(ctx, { step:'date', data:{} });
   await ctx.reply('Дата (ДД.ММ.ГГГГ) или оставь пусто — возьму сегодня', cancelKeyboard());
 });
 bot.hears(RX_CANCEL, async ctx=>{
-  ctx.session.wiz = null;
+  clearWiz(ctx);
   await showMenu(ctx,'Ок, отменил ввод.');
 });
 
 bot.on('text', async (ctx,next)=>{
-  if(!ctx.session?.wiz) return next();
-  const st=ctx.session.wiz; const txt=(ctx.message.text||'').trim();
+  const st=getWiz(ctx);
+  if(!st) return next();
+
+  const txt=(ctx.message.text||'').trim();
   try{
-    if(st.step==='date'){ st.data.date=normalizeDate(txt); st.step='pay'; return ctx.reply('Платёжка (например: AdvCash, Capitalist, Card)', cancelKeyboard()); }
-    if(st.step==='pay'){ if(!txt) return ctx.reply('Платёжка не может быть пустой. Введите снова.', cancelKeyboard()); st.data.pay=txt; st.step='type';
+    if(st.step==='date'){ st.data.date=normalizeDate(txt); st.step='pay'; setWiz(ctx,st); return ctx.reply('Платёжка (например: AdvCash, Capitalist, Card)', cancelKeyboard()); }
+    if(st.step==='pay'){ if(!txt) return ctx.reply('Платёжка не может быть пустой. Введите снова.', cancelKeyboard()); st.data.pay=txt; st.step='type'; setWiz(ctx,st);
       const types=await getTypes(); const kb=Markup.keyboard([...types.map(t=>[t]),['❌ Отмена ввода']]).resize().oneTime(); return ctx.reply('Тип расхода (выберите из списка или введите):', kb); }
-    if(st.step==='type'){ st.data.type=await normalizeType(txt); st.step='geo'; return ctx.reply('GEO (две буквы, например UA, KZ, PL)', cancelKeyboard()); }
-    if(st.step==='geo'){ if(!txt) return ctx.reply('GEO не может быть пустым.', cancelKeyboard()); st.data.geo=txt.toUpperCase(); st.step='amt'; return ctx.reply('Сумма (число, точка/запятая допустимы)', cancelKeyboard()); }
-    if(st.step==='amt'){ const n=Number(txt.replace(',','.')); if(!(n>0)) return ctx.reply('Сумма должна быть > 0. Введите снова.', cancelKeyboard()); st.data.amt=n; st.step='curr';
+    if(st.step==='type'){ st.data.type=await normalizeType(txt); st.step='geo'; setWiz(ctx,st); return ctx.reply('GEO (две буквы, например UA, KZ, PL)', cancelKeyboard()); }
+    if(st.step==='geo'){ if(!txt) return ctx.reply('GEO не может быть пустым.', cancelKeyboard()); st.data.geo=txt.toUpperCase(); st.step='amt'; setWiz(ctx,st); return ctx.reply('Сумма (число, точка/запятая допустимы)', cancelKeyboard()); }
+    if(st.step==='amt'){ const n=Number(txt.replace(',','.')); if(!(n>0)) return ctx.reply('Сумма должна быть > 0. Введите снова.', cancelKeyboard()); st.data.amt=n; st.step='curr'; setWiz(ctx,st);
       const curr=await getCurrencies(); const kb=Markup.keyboard([...curr.map(c=>[c]),['❌ Отмена ввода']]).resize().oneTime(); return ctx.reply('Валюта (выберите из списка или введите):', kb); }
-    if(st.step==='curr'){ st.data.curr=normalizeCurr(txt); st.step='comm'; return ctx.reply('Комментарий (можно пусто):', cancelKeyboard()); }
+    if(st.step==='curr'){ st.data.curr=normalizeCurr(txt); st.step='comm'; setWiz(ctx,st); return ctx.reply('Комментарий (можно пусто):', cancelKeyboard()); }
     if(st.step==='comm'){
       st.data.comm=txt; const row=[st.data.date,st.data.pay,st.data.type,st.data.geo,st.data.amt,st.data.curr,st.data.comm];
-      await validateRow(row); const rowNum=await appendExpenseRow(ctx.from.id,row); ctx.session.wiz=null;
+      await validateRow(row); const rowNum=await appendExpenseRow(ctx.from.id,row); clearWiz(ctx);
       const dd=ddmmyyyy(st.data.date);
       return ctx.reply(`✅ Добавлено:
 Дата: ${dd}
@@ -283,7 +286,7 @@ GEO: ${st.data.geo}
 
 Строка №${rowNum}. Колонка G (USD) посчитается формулой.`, mainKeyboard());
     }
-  }catch(e){ ctx.session.wiz=null; return ctx.reply('❌ '+(e.message||e), mainKeyboard()); }
+  }catch(e){ clearWiz(ctx); return ctx.reply('❌ '+(e.message||e), mainKeyboard()); }
 });
 
 /* Совместимость: /exp одной строкой */
