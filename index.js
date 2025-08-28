@@ -35,7 +35,7 @@ const cache = new Map();
 const setCache = (k, v, ms = 10 * 60 * 1000) => cache.set(k, { v, exp: Date.now() + ms });
 const getCache = (k) => { const it = cache.get(k); if (!it || Date.now() > it.exp) { cache.delete(k); return null; } return it.v; };
 
-/** ====== WIZARD STATE (вместо ctx.session) ====== **/
+/** ====== WIZARD STATE (Map вместо ctx.session) ====== **/
 const wizards = new Map(); // key -> { step, data }
 const key = (ctx) => String(ctx.chat?.id ?? ctx.from?.id);
 const getWiz   = (ctx) => wizards.get(key(ctx));
@@ -64,6 +64,8 @@ const mainKeyboard = () =>
   ]).resize().persistent();
 
 const cancelKeyboard = () => Markup.keyboard([['❌ Отмена ввода']]).resize();
+const dateKeyboard   = () => Markup.keyboard([['Сегодня'], ['❌ Отмена ввода']]).resize().oneTime();
+const commentKeyboard= () => Markup.keyboard([['Без комментария'], ['❌ Отмена ввода']]).resize().oneTime();
 
 /** ====== REGEX-ТРИГГЕРЫ ====== **/
 const RX_ADD     = [/^(\+|➕)?\s*добавить\s+расход$/i];
@@ -78,9 +80,21 @@ const RX_CANCEL  = [/^(❌)?\s*отмена\s+ввода$/i];
 function ddmmyyyy(d){ const dd=String(d.getDate()).padStart(2,'0'); const mm=String(d.getMonth()+1).padStart(2,'0'); const yy=d.getFullYear(); return `${dd}.${mm}.${yy}`; }
 function parseDDMMYYYY(s){
   const m=String(s||'').trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-  if(!m) throw new Error('Дата должна быть ДД.ММ.ГГГГ или пусто');
+  if(!m) throw new Error('Дата должна быть ДД.ММ.ГГГГ или кнопка «Сегодня»');
   const d=new Date(+m[3],+m[2]-1,+m[1]); if(isNaN(d.getTime())) throw new Error('Некорректная дата'); return d;
 }
+function isTodayInput(s){
+  return /^сегодня$|^today$|^now$/i.test(String(s||'').trim());
+}
+function normalizeDate(raw){
+  const s = String(raw||'').trim();
+  if (!s || isTodayInput(s)) return new Date(); // пусто/Сегодня => сегодня
+  return parseDDMMYYYY(s);
+}
+function isSkipComment(s){
+  return /^(без\s+комментария|пропустить|нет(\s+комментария)?|skip|—|-|–|\.{0,3})$/i.test(String(s||'').trim());
+}
+
 async function ensureMetaSheet(){
   const info = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const has = (info.data.sheets||[]).some(s=>s.properties?.title===SHEET_META);
@@ -138,7 +152,6 @@ async function normalizeType(raw){
   return found || (t ? (t[0].toUpperCase()+t.slice(1).toLowerCase()) : t);
 }
 const normalizeCurr = raw => String(raw||'').trim().toUpperCase();
-const normalizeDate = raw => { const s=String(raw||'').trim(); return s?parseDDMMYYYY(s):new Date(); };
 
 async function validateRow([date,pay,type,geo,amt,curr]){
   const types=await getTypes(); const currencies=await getCurrencies(); const errs=[];
@@ -248,10 +261,10 @@ bot.hears(RX_UNDO, async ctx=>{
 });
 bot.hears(RX_HELP,  ctx=>ctx.reply(HELP_TEXT, mainKeyboard()));
 
-/* ===== Мастер «Добавить расход» (на Map, без ctx.session) ===== */
+/* ===== Мастер «Добавить расход» (Map-состояние) ===== */
 bot.hears(RX_ADD, async ctx=>{
   setWiz(ctx, { step:'date', data:{} });
-  await ctx.reply('Дата (ДД.ММ.ГГГГ) или оставь пусто — возьму сегодня', cancelKeyboard());
+  await ctx.reply('Дата (ДД.ММ.ГГГГ) или нажми «Сегодня»', dateKeyboard());
 });
 bot.hears(RX_CANCEL, async ctx=>{
   clearWiz(ctx);
@@ -264,17 +277,45 @@ bot.on('text', async (ctx,next)=>{
 
   const txt=(ctx.message.text||'').trim();
   try{
-    if(st.step==='date'){ st.data.date=normalizeDate(txt); st.step='pay'; setWiz(ctx,st); return ctx.reply('Платёжка (например: AdvCash, Capitalist, Card)', cancelKeyboard()); }
-    if(st.step==='pay'){ if(!txt) return ctx.reply('Платёжка не может быть пустой. Введите снова.', cancelKeyboard()); st.data.pay=txt; st.step='type'; setWiz(ctx,st);
-      const types=await getTypes(); const kb=Markup.keyboard([...types.map(t=>[t]),['❌ Отмена ввода']]).resize().oneTime(); return ctx.reply('Тип расхода (выберите из списка или введите):', kb); }
-    if(st.step==='type'){ st.data.type=await normalizeType(txt); st.step='geo'; setWiz(ctx,st); return ctx.reply('GEO (две буквы, например UA, KZ, PL)', cancelKeyboard()); }
-    if(st.step==='geo'){ if(!txt) return ctx.reply('GEO не может быть пустым.', cancelKeyboard()); st.data.geo=txt.toUpperCase(); st.step='amt'; setWiz(ctx,st); return ctx.reply('Сумма (число, точка/запятая допустимы)', cancelKeyboard()); }
-    if(st.step==='amt'){ const n=Number(txt.replace(',','.')); if(!(n>0)) return ctx.reply('Сумма должна быть > 0. Введите снова.', cancelKeyboard()); st.data.amt=n; st.step='curr'; setWiz(ctx,st);
-      const curr=await getCurrencies(); const kb=Markup.keyboard([...curr.map(c=>[c]),['❌ Отмена ввода']]).resize().oneTime(); return ctx.reply('Валюта (выберите из списка или введите):', kb); }
-    if(st.step==='curr'){ st.data.curr=normalizeCurr(txt); st.step='comm'; setWiz(ctx,st); return ctx.reply('Комментарий (можно пусто):', cancelKeyboard()); }
+    if(st.step==='date'){
+      st.data.date = normalizeDate(txt);           // пусто/Сегодня — ок
+      st.step='pay'; setWiz(ctx,st);
+      return ctx.reply('Платёжка (например: AdvCash, Capitalist, Card)', cancelKeyboard());
+    }
+    if(st.step==='pay'){
+      if(!txt) return ctx.reply('Платёжка не может быть пустой. Введите снова.', cancelKeyboard());
+      st.data.pay=txt; st.step='type'; setWiz(ctx,st);
+      const types=await getTypes();
+      const kb=Markup.keyboard([...types.map(t=>[t]),['❌ Отмена ввода']]).resize().oneTime();
+      return ctx.reply('Тип расхода (выберите из списка или введите):', kb);
+    }
+    if(st.step==='type'){
+      st.data.type=await normalizeType(txt); st.step='geo'; setWiz(ctx,st);
+      return ctx.reply('GEO (две буквы, например UA, KZ, PL)', cancelKeyboard());
+    }
+    if(st.step==='geo'){
+      if(!txt) return ctx.reply('GEO не может быть пустым.', cancelKeyboard());
+      st.data.geo=txt.toUpperCase(); st.step='amt'; setWiz(ctx,st);
+      return ctx.reply('Сумма (число, точка/запятая допустимы)', cancelKeyboard());
+    }
+    if(st.step==='amt'){
+      const n=Number(txt.replace(',','.'));
+      if(!(n>0)) return ctx.reply('Сумма должна быть > 0. Введите снова.', cancelKeyboard());
+      st.data.amt=n; st.step='curr'; setWiz(ctx,st);
+      const curr=await getCurrencies();
+      const kb=Markup.keyboard([...curr.map(c=>[c]),['❌ Отмена ввода']]).resize().oneTime();
+      return ctx.reply('Валюта (выберите из списка или введите):', kb);
+    }
+    if(st.step==='curr'){
+      st.data.curr=normalizeCurr(txt); st.step='comm'; setWiz(ctx,st);
+      return ctx.reply('Комментарий (можно пропустить: «Без комментария»)', commentKeyboard());
+    }
     if(st.step==='comm'){
-      st.data.comm=txt; const row=[st.data.date,st.data.pay,st.data.type,st.data.geo,st.data.amt,st.data.curr,st.data.comm];
-      await validateRow(row); const rowNum=await appendExpenseRow(ctx.from.id,row); clearWiz(ctx);
+      st.data.comm = isSkipComment(txt) ? '' : txt;
+      const row=[st.data.date,st.data.pay,st.data.type,st.data.geo,st.data.amt,st.data.curr,st.data.comm];
+      await validateRow(row);
+      const rowNum=await appendExpenseRow(ctx.from.id,row);
+      clearWiz(ctx);
       const dd=ddmmyyyy(st.data.date);
       return ctx.reply(`✅ Добавлено:
 Дата: ${dd}
@@ -286,14 +327,18 @@ GEO: ${st.data.geo}
 
 Строка №${rowNum}. Колонка G (USD) посчитается формулой.`, mainKeyboard());
     }
-  }catch(e){ clearWiz(ctx); return ctx.reply('❌ '+(e.message||e), mainKeyboard()); }
+  }catch(e){
+    clearWiz(ctx);
+    return ctx.reply('❌ '+(e.message||e), mainKeyboard());
+  }
 });
 
 /* Совместимость: /exp одной строкой */
 bot.hears(/^\/exp(?:@[\w_]+)?\s*(.*)$/i, async ctx=>{
   try{
     const p=(ctx.match?.[1]||'').split(';').map(s=>s.trim()); while(p.length<7)p.push('');
-    const [dateStr,pay,typeRaw,geoRaw,amtStr,currRaw,comm]=p;
+    const [dateStr,pay,typeRaw,geoRaw,amtStr,currRaw,commRaw]=p;
+    const comm = isSkipComment(commRaw) ? '' : commRaw;
     const row=[ normalizeDate(dateStr), pay||'N/A', await normalizeType(typeRaw), String(geoRaw||'').toUpperCase(),
                 Number(String(amtStr||'').replace(',','.')), normalizeCurr(currRaw), comm ];
     await validateRow(row); await appendExpenseRow(ctx.from.id,row);
