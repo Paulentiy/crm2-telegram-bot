@@ -7,7 +7,7 @@ const {
   TELEGRAM_TOKEN,
   SPREADSHEET_ID,
   GOOGLE_SERVICE_ACCOUNT_B64,
-  WEBHOOK_BASE_URL // оставь пустым для long polling
+  WEBHOOK_BASE_URL // пусто => long polling
 } = process.env;
 
 if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
@@ -59,7 +59,7 @@ const mainKeyboard = () =>
 const cancelKeyboard = () =>
   Markup.keyboard([['❌ Отмена ввода']]).resize();
 
-/** ====== REGEX ТРИГГЕРЫ (устойчивые к эмодзи/пробелам/регистру) ====== **/
+/** ====== REGEX-ТРИГГЕРЫ (устойчивые) ====== **/
 const RX_ADD     = [/^(\+|➕)?\s*добавить\s+расход$/i];
 const RX_TYPES   = [/^(📋)?\s*типы$/i];
 const RX_CURR    = [/^(💱)?\s*валюты$/i, /^currencies$/i];
@@ -128,7 +128,10 @@ async function getCurrencies(force=false){
 }
 async function getRatesMap(){
   const c = getCache('rates'); if (c) return c;
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!A2:B` });
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_RATES}!A2:B`
+  });
   const map = {};
   for (const row of (res.data.values || [])){
     const code = String(row[0]||'').trim().toUpperCase();
@@ -139,6 +142,7 @@ async function getRatesMap(){
   setCache('rates', map);
   return map;
 }
+async function getRatesOrEmpty(){ try { return await getRatesMap(); } catch { return {}; } }
 
 /** ====== AUTOFIX & VALIDATION ====== **/
 async function normalizeType(raw){
@@ -235,20 +239,6 @@ async function loadExpensesAtoG(){
   return res.data.values || [];
 }
 function parseDateCell(s){ try { return parseDDMMYYYY(s); } catch { return null; } }
-async function getRatesOrEmpty(){ try { return await getRatesMap(); } catch { return {}; } }
-async function getRatesMap(){
-  const c = getCache('rates'); if (c) return c;
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!A2:B` });
-  const map = {};
-  for (const row of (res.data.values || [])){
-    const code = String(row[0]||'').trim().toUpperCase();
-    const rate = Number(String(row[1]||'').replace(',', '.'));
-    if (code) map[code] = rate > 0 ? rate : (code === 'USD' ? 1 : NaN);
-  }
-  if (!map.USD) map.USD = 1;
-  setCache('rates', map);
-  return map;
-}
 async function sumUSD(start, end){
   const rows = await loadExpensesAtoG();
   const rates = await getRatesOrEmpty();
@@ -256,7 +246,7 @@ async function sumUSD(start, end){
   for (const r of rows){
     const d = parseDateCell(r[0]); if (!d) continue;
     if (d < start || d >= end) continue;
-    const amt = Number(String(r[4]||'').replace(',', '.')) || 0;
+    const amt  = Number(String(r[4]||'').replace(',', '.')) || 0;
     const curr = String(r[5]||'').trim().toUpperCase();
     const usdCell = Number(String(r[6]||'').replace(',', '.')) || NaN;
     if (!isNaN(usdCell)) sum += usdCell;
@@ -272,7 +262,7 @@ function startOfMonth(){ const d = new Date(); return new Date(d.getFullYear(), 
 const bot = new Telegraf(TELEGRAM_TOKEN, { handlerTimeout: 30000 });
 bot.use(session());
 
-// простое логирование входящих текстов для диагностики
+// простое логирование входящих текстов
 bot.on('text', (ctx, next) => { console.log('TEXT:', ctx.message.text); return next(); });
 
 // анти-дубли по update_id
@@ -421,7 +411,7 @@ bot.hears(/^\/exp(?:@[\w_]+)?\s*(.*)$/i, async (ctx) => {
   }
 });
 
-// общий fallback: если не кнопка и не мастер — показываем меню
+// общий fallback
 bot.on('text', async (ctx) => showMenu(ctx));
 
 /** ====== SERVER START ====== **/
