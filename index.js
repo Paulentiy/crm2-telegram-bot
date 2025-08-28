@@ -30,12 +30,12 @@ const SHEET_TYPES    = 'Справочники';   // A2:A — Тип расхо
 const SHEET_RATES    = 'Курсы';         // A: код валюты, B: курс к USD (1 USD = 1)
 const SHEET_META     = 'BotMeta';       // служебный лист: A user_id, B row_number, C ISO ts
 
-/** ====== SIMPLE CACHE (memory) ====== **/
+/** ====== CACHE ====== **/
 const cache = new Map();
 const setCache = (k, v, ms = 10 * 60 * 1000) => cache.set(k, { v, exp: Date.now() + ms });
 const getCache = (k) => { const it = cache.get(k); if (!it || Date.now() > it.exp) { cache.delete(k); return null; } return it.v; };
 
-/** ====== HELP / MENUS ====== **/
+/** ====== TEXTS & KEYBOARDS ====== **/
 const HELP_TEXT =
 `Привет! Я бот для внесения расходов в CRM2.
 
@@ -45,7 +45,7 @@ const HELP_TEXT =
 • ↩️ Отменить последнюю — отмена вашей последней записи
 • 📋 Типы / 💱 Валюты — списки из «Справочники» и «Курсы»
 
-Формат записи (если вручную): 
+Формат (если вручную): 
 /exp Дата; Платёжка; Тип; GEO; Сумма; Валюта; Коммент
 Пример: /exp ; AdvCash; Прокси; UA; 120; USD; тест`;
 
@@ -59,9 +59,16 @@ const mainKeyboard = () =>
 const cancelKeyboard = () =>
   Markup.keyboard([['❌ Отмена ввода']]).resize();
 
-/** ====== HELPERS ====== **/
-const normCmd = (text) => String(text || '').trim().split(/\s+/)[0].replace(/@[\w_]+$/i, '').toLowerCase();
+/** ====== REGEX ТРИГГЕРЫ (устойчивые к эмодзи/пробелам/регистру) ====== **/
+const RX_ADD     = [/^(\+|➕)?\s*добавить\s+расход$/i];
+const RX_TYPES   = [/^(📋)?\s*типы$/i];
+const RX_CURR    = [/^(💱)?\s*валюты$/i, /^currencies$/i];
+const RX_STATS   = [/^(📊)?\s*статистика$/i];
+const RX_UNDO    = [/^(↩️)?\s*отменить\s+последнюю$/i];
+const RX_HELP    = [/^(ℹ️)?\s*помощь$/i, /^help$/i];
+const RX_CANCEL  = [/^(❌)?\s*отмена\s+ввода$/i];
 
+/** ====== HELPERS ====== **/
 function ddmmyyyy(d){
   const dd = String(d.getDate()).padStart(2,'0');
   const mm = String(d.getMonth()+1).padStart(2,'0');
@@ -75,7 +82,6 @@ function parseDDMMYYYY(s){
   if (isNaN(d.getTime())) throw new Error('Некорректная дата');
   return d;
 }
-
 async function ensureMetaSheet(){
   const info = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const has = (info.data.sheets || []).some(s => s.properties?.title === SHEET_META);
@@ -151,13 +157,10 @@ async function validateRow([date, pay, type, geo, amt, curr]){
 
   if (!(date instanceof Date) || isNaN(date.getTime())) errs.push('Некорректная дата');
   if (!pay) errs.push('Платёжка не может быть пустой');
-
   const typeOk = types.some(t => t.toLowerCase() === String(type||'').trim().toLowerCase());
   if (!typeOk) errs.push(`Тип расхода не из списка: «${type}». Допустимо: ${types.join(', ')}`);
-
   const currClean = String(curr||'').trim().toUpperCase();
   if (!currencies.includes(currClean)) errs.push(`Валюта не из «Курсы»: «${currClean}». Допустимо: ${currencies.join(', ')}`);
-
   if (!(Number(amt) > 0)) errs.push('Сумма должна быть > 0');
 
   if (errs.length) throw new Error(errs.join('\n'));
@@ -188,7 +191,12 @@ async function appendExpenseRow(userId, [date, pay, type, geo, amt, curr, commen
   }
   return rowNumber;
 }
-
+async function getSheetIdByTitle(title){
+  const info = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  const sh = (info.data.sheets || []).find(s => s.properties?.title === title);
+  if (!sh) throw new Error('Нет листа: ' + title);
+  return sh.properties.sheetId;
+}
 async function undoLastForUser(userId){
   await ensureMetaSheet();
   const res = await sheets.spreadsheets.values.get({
@@ -218,13 +226,6 @@ async function undoLastForUser(userId){
   return { ok:true, row: rowNumber };
 }
 
-async function getSheetIdByTitle(title){
-  const info = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  const sh = (info.data.sheets || []).find(s => s.properties?.title === title);
-  if (!sh) throw new Error('Нет листа: ' + title);
-  return sh.properties.sheetId;
-}
-
 /** ====== STATS ====== **/
 async function loadExpensesAtoG(){
   const res = await sheets.spreadsheets.values.get({
@@ -234,9 +235,23 @@ async function loadExpensesAtoG(){
   return res.data.values || [];
 }
 function parseDateCell(s){ try { return parseDDMMYYYY(s); } catch { return null; } }
+async function getRatesOrEmpty(){ try { return await getRatesMap(); } catch { return {}; } }
+async function getRatesMap(){
+  const c = getCache('rates'); if (c) return c;
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_RATES}!A2:B` });
+  const map = {};
+  for (const row of (res.data.values || [])){
+    const code = String(row[0]||'').trim().toUpperCase();
+    const rate = Number(String(row[1]||'').replace(',', '.'));
+    if (code) map[code] = rate > 0 ? rate : (code === 'USD' ? 1 : NaN);
+  }
+  if (!map.USD) map.USD = 1;
+  setCache('rates', map);
+  return map;
+}
 async function sumUSD(start, end){
   const rows = await loadExpensesAtoG();
-  const rates = await getRatesMap();
+  const rates = await getRatesOrEmpty();
   let sum = 0;
   for (const r of rows){
     const d = parseDateCell(r[0]); if (!d) continue;
@@ -257,6 +272,9 @@ function startOfMonth(){ const d = new Date(); return new Date(d.getFullYear(), 
 const bot = new Telegraf(TELEGRAM_TOKEN, { handlerTimeout: 30000 });
 bot.use(session());
 
+// простое логирование входящих текстов для диагностики
+bot.on('text', (ctx, next) => { console.log('TEXT:', ctx.message.text); return next(); });
+
 // анти-дубли по update_id
 const seen = new Map(); const seenTTLms = 10*60*1000;
 setInterval(() => { const now = Date.now(); for (const [k,t] of seen) if (now-t>seenTTLms) seen.delete(k); }, 60000);
@@ -268,11 +286,11 @@ async function showMenu(ctx, text = 'Выберите действие:'){ retur
 bot.start(async (ctx) => { await ctx.reply(HELP_TEXT, mainKeyboard()); });
 bot.help(async (ctx)  => { await ctx.reply(HELP_TEXT, mainKeyboard()); });
 
-bot.hears('📋 Типы', async (ctx) => {
+bot.hears(RX_TYPES, async (ctx) => {
   const types = await getTypes();
   await ctx.reply('Типы расхода:\n• ' + types.join('\n• '), mainKeyboard());
 });
-bot.hears('💱 Валюты', async (ctx) => {
+bot.hears(RX_CURR, async (ctx) => {
   try{
     const curr = await getCurrencies();
     await ctx.reply('Доступные валюты:\n• ' + curr.join('\n• '), mainKeyboard());
@@ -280,7 +298,7 @@ bot.hears('💱 Валюты', async (ctx) => {
     await ctx.reply('❌ ' + e.message, mainKeyboard());
   }
 });
-bot.hears('📊 Статистика', async (ctx) => {
+bot.hears(RX_STATS, async (ctx) => {
   await ctx.reply('Что показать?', Markup.inlineKeyboard([
     [ Markup.button.callback('📅 Сегодня', 'stats:day') ],
     [ Markup.button.callback('🗓 7 дней',  'stats:week') ],
@@ -291,7 +309,7 @@ bot.action('stats:day',  async (ctx) => { await ctx.answerCbQuery(); const s=sta
 bot.action('stats:week', async (ctx) => { await ctx.answerCbQuery(); const e=addDays(startOfToday(),1); const s=addDays(e,-7); const x=await sumUSD(s,e); await ctx.editMessageText(`Сумма за 7 дней: ${x.toFixed(2)} USD`); });
 bot.action('stats:month',async (ctx) => { await ctx.answerCbQuery(); const s=startOfMonth(); const e=addDays(startOfToday(),1); const x=await sumUSD(s,e); await ctx.editMessageText(`Сумма за месяц: ${x.toFixed(2)} USD`); });
 
-bot.hears('↩️ Отменить последнюю', async (ctx) => {
+bot.hears(RX_UNDO, async (ctx) => {
   try{
     const r = await undoLastForUser(ctx.from.id);
     if (r.ok) await ctx.reply(`Удалил строку №${r.row}`, mainKeyboard());
@@ -301,19 +319,19 @@ bot.hears('↩️ Отменить последнюю', async (ctx) => {
   }
 });
 
-bot.hears('ℹ️ Помощь', async (ctx) => ctx.reply(HELP_TEXT, mainKeyboard()));
+bot.hears(RX_HELP, async (ctx) => ctx.reply(HELP_TEXT, mainKeyboard()));
 
 // ===== Мастер "Добавить расход" =====
-bot.hears('➕ Добавить расход', async (ctx) => {
+bot.hears(RX_ADD, async (ctx) => {
   ctx.session.wiz = { step: 'date', data: {} };
   await ctx.reply('Дата (ДД.ММ.ГГГГ) или оставь пусто — возьму сегодня', cancelKeyboard());
 });
-
-bot.hears('❌ Отмена ввода', async (ctx) => {
+bot.hears(RX_CANCEL, async (ctx) => {
   ctx.session.wiz = null;
   await showMenu(ctx, 'Ок, отменил ввод.');
 });
 
+// обработчик шагов мастера
 bot.on('text', async (ctx, next) => {
   if (!ctx.session?.wiz) return next();
 
@@ -369,7 +387,7 @@ bot.on('text', async (ctx, next) => {
       await ctx.reply(
         '✅ Добавлено:\n' +
         `Дата: ${dd}\nПлатёжка: ${st.data.pay}\nТип: ${st.data.type}\nGEO: ${st.data.geo}\n` +
-        `Сумма: ${st.data.amt}\nВалюта: ${st.data.curr}` + (st.data.comm ? `\нКомментарий: ${st.data.comm}` : '') +
+        `Сумма: ${st.data.amt}\nВалюта: ${st.data.curr}` + (st.data.comm ? `\nКомментарий: ${st.data.comm}` : '') +
         `\n\nСтрока №${rowNum}. Колонка G (USD) посчитается формулой.`,
         mainKeyboard()
       );
@@ -381,7 +399,7 @@ bot.on('text', async (ctx, next) => {
   }
 });
 
-// Совместимость: если кто-то всё же пришлёт /exp …
+// Совместимость: если пришлют /exp …
 bot.hears(/^\/exp(?:@[\w_]+)?\s*(.*)$/i, async (ctx) => {
   try {
     const p = (ctx.match?.[1] || '').split(';').map(s=>s.trim()); while (p.length<7) p.push('');
@@ -403,10 +421,10 @@ bot.hears(/^\/exp(?:@[\w_]+)?\s*(.*)$/i, async (ctx) => {
   }
 });
 
-// fallback
+// общий fallback: если не кнопка и не мастер — показываем меню
 bot.on('text', async (ctx) => showMenu(ctx));
 
-/** ====== START SERVER ====== **/
+/** ====== SERVER START ====== **/
 const app = express();
 app.get('/health', (_, res) => res.send('ok'));
 const PORT = process.env.PORT || 3000;
