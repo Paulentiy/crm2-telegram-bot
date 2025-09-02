@@ -2,6 +2,8 @@
 import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 import { google } from 'googleapis';
+import { registerCardFlow } from "./cardFlow.js";
+
 
 /** ====== ENV ====== **/
 const {
@@ -192,6 +194,9 @@ const startOfMonth=()=>{ const d=new Date(); return new Date(d.getFullYear(), d.
 
 /** ====== BOT ====== **/
 const bot = new Telegraf(TELEGRAM_TOKEN, { handlerTimeout: 30000 });
+// Подключаем модуль CardFlow (новые команды + автоуведомления)
+registerCardFlow(bot);
+
 
 // Логи входящих текстов
 bot.on('text', (ctx, next) => { console.log('TEXT:', ctx.message.text); return next(); });
