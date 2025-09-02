@@ -24,27 +24,70 @@ const sheets = google.sheets({ version: "v4", auth });
 // Читаем данные листа
 async function readSheet(title) {
   const range = `'${title}'!A1:Z2000`;
-  const { data } = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
-  const [header = [], ...rows] = data.values ?? [];
-  return { header, rows };
+  try {
+    const { data } = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
+    const [header = [], ...rows] = data.values ?? [];
+    return { header, rows };
+  } catch {
+    return { header: [], rows: [] };
+  }
 }
 
 // --- Вычисляем статус ---
+// --- Вычисляем статус ---
 export async function computeStatusText() {
   const main = await readSheet(SHEET_NAMES.main);
-  const idx = (h) => main.header.indexOf(h);
+  
+  // Функция для безопасного получения индекса колонки
+  const idx = (header, colName) => {
+    const index = header.indexOf(colName);
+    if (index === -1) return null;  // Возвращаем null, если не нашли колонку
+    return index;
+  };
 
   let freeSlots = 0;
   let sumHolds = 0;
   let reissue = 0;
 
-  for (const r of main.rows) {
-    const total = parseInt(r[idx("Слоты всего")] || "0", 10);
-    const used = parseInt(r[idx("Слоты занято")] || "0", 10);
-    freeSlots += Math.max(total - used, 0);
-    sumHolds += parseFloat((r[idx("Холды $")] || "0").replace(",", "."));
-    if ((r[idx("Статус")] ?? "").trim() === "Перевыпуск") reissue++;
+  const iTotal = idx(main.header, "Слоты всего");
+  const iUsed = idx(main.header, "Слоты занято");
+  const iHold = idx(main.header, "Холды $");
+  const iStat = idx(main.header, "Статус");
+
+  if (main.rows.length && iTotal !== null && iUsed !== null) {
+    for (const r of main.rows) {
+      const total = parseInt(r[iTotal] || "0", 10);
+      const used = parseInt(r[iUsed] || "0", 10);
+      freeSlots += Math.max(total - used, 0);
+      if (iHold !== null) sumHolds += parseFloat((r[iHold] || "0").replace(",", "."));
+      if (iStat !== null && (r[iStat] || "").trim() === "Перевыпуск") reissue++;
+    }
   }
+
+  const buffer = await readSheet(SHEET_NAMES.buffer);
+  const iBufStatus = idx(buffer.header, "Статус");
+  const freeBuffer = (buffer.rows.length && iBufStatus !== null)
+    ? buffer.rows.filter((r) => (r[iBufStatus] || "") === "Свободна").length
+    : 0;
+
+  const alerts = [];
+  if (freeSlots < THRESHOLD_SLOTS) alerts.push(`Мало свободных слотов: ${freeSlots} (< ${THRESHOLD_SLOTS})`);
+  if (freeBuffer < THRESHOLD_BUFFER_FREE) alerts.push(`Мало свободных буферок: ${freeBuffer} (< ${THRESHOLD_BUFFER_FREE})`);
+
+  let text =
+    `📊 *Статус карт*\n` +
+    `Свободные слоты: *${freeSlots}*\n` +
+    `Свободные буферки: *${freeBuffer}*\n` +
+    `Зависшие холды: *$${sumHolds.toFixed(2)}*\n` +
+    `Карт к перевыпуску: *${reissue}*`;
+
+  if (alerts.length) text += `\n\n⚠️ ${alerts.join(" | ")}`;
+  if (!main.rows.length && !buffer.rows.length) {
+    text += `\n\nℹ️ Таблица пустая — всё ок, считаю нули. Можешь начать заполнять листы.`;
+  }
+  return text;
+}
+
 
   const buffer = await readSheet(SHEET_NAMES.buffer);
   const iBufStatus = buffer.header.indexOf("Статус");
