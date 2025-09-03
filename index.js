@@ -56,22 +56,32 @@ const HELP_TEXT =
 • ➕ Добавить расход / ➕ Добавить прибыль — пошаговый ввод
 • 📊 Статистика — (пока по расходам; расширим)
 • ↩️ Отменить последнюю — удалить последнюю запись (любой лист)
-• 📋 Типы / 💱 Валюты — списки из «Справочники» и «Курсы»
 • 💳 Карты - работа с картами
 /whoami — показать ваш user_id`;
 
+// ГЛАВНОЕ МЕНЮ
 const mainKeyboard = () =>
   Markup.keyboard([
     ['➕ Добавить расход', '➕ Добавить прибыль'],
     ['📊 Статистика'],
-    ['📋 Типы', '💱 Валюты'],
-    ['💳 Карты'],                   // ← новая кнопка
-    ['↩️ Отменить последнюю', 'ℹ️ Помощь']
+    ['💳 Карты'],
+    ['🏠 Главное меню']                 // оставим и здесь — работает как «обновить /start»
   ]).resize().persistent();
 
-const cancelKeyboard  = () => Markup.keyboard([['❌ Отмена ввода']]).resize();
-const dateKeyboard    = () => Markup.keyboard([['Сегодня'], ['❌ Отмена ввода']]).resize().oneTime();
-const commentKeyboard = () => Markup.keyboard([['Без комментария'], ['❌ Отмена ввода']]).resize().oneTime();
+// Кнопка отмены/выхода в мастерах
+const cancelKeyboard  = () =>
+  Markup.keyboard([['❌ Отмена ввода'], ['🏠 Главное меню']]).resize();
+
+// Шаг выбора даты
+const dateKeyboard    = () =>
+  Markup.keyboard([['Сегодня'], ['❌ Отмена ввода'], ['🏠 Главное меню']])
+    .resize().oneTime();
+
+// Шаг комментария
+const commentKeyboard = () =>
+  Markup.keyboard([['Без комментария'], ['❌ Отмена ввода'], ['🏠 Главное меню']])
+    .resize().oneTime();
+
 
 /** ====== HELPERS ====== **/
 function ddmmyyyy(d){ const dd=String(d.getDate()).padStart(2,'0'); const mm=String(d.getMonth()+1).padStart(2,'0'); const yy=d.getFullYear(); return `${dd}.${mm}.${yy}`; }
@@ -208,19 +218,17 @@ const seen=new Map(); const seenTTL=10*60*1000;
 setInterval(()=>{ const now=Date.now(); for(const [k,t] of seen){ if(now-t>seenTTL) seen.delete(k); }},60000);
 bot.use((ctx,next)=>{ const id=ctx.update?.update_id; if(id!=null){ if(seen.has(id)) return; seen.set(id,Date.now()); } return next(); });
 
-// Меню/команды
-const showMenu=(ctx,text='Выберите действие:')=>ctx.reply(text,mainKeyboard());
-bot.start(ctx=>ctx.reply(HELP_TEXT,mainKeyboard()));
 bot.help (ctx=>ctx.reply(HELP_TEXT,mainKeyboard()));
 bot.command('whoami', ctx=>ctx.reply(`user_id: ${ctx.from.id}\nchat_id: ${ctx.chat.id}`));
 
-bot.hears('📋 Типы', async ctx=>{
-  const types=await getTypes(); await ctx.reply('Типы расхода:\n• '+types.join('\n• '), mainKeyboard());
+// «Главное меню» — доступно в любой момент
+bot.hears('🏠 Главное меню', async (ctx) => {
+  clearWiz(ctx);                    // сбрасываем возможный мастер-ввод
+  await ctx.reply('Главное меню:', mainKeyboard());
 });
-bot.hears('💱 Валюты', async ctx=>{
-  try{ const curr=await getCurrencies(); await ctx.reply('Валюты:\n• '+curr.join('\n• '), mainKeyboard()); }
-  catch(e){ await ctx.reply('❌ '+e.message, mainKeyboard()); }
-});
+
+// На /start тоже показываем главное меню
+bot.start((ctx) => ctx.reply(HELP_TEXT, mainKeyboard()));
 
 /* ===== Расход: мастер (старый функционал) ===== */
 bot.hears('➕ Добавить расход', async ctx=>{
