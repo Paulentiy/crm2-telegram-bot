@@ -339,18 +339,24 @@ export function registerCardFlow(bot) {
   });
 
 // Автоуведомления в 11:00, 15:00, 19:00, 23:00 по Киеву (UTC+3) => 08:00, 12:00, 16:00, 20:00 UTC
-nodeSchedule.scheduleJob('0 8,12,16,20 * * *', async () => {
-  try {
-    const text = await computeStatusText();
-    const subs = await listSubs();
-    for (const s of subs) {
-      try {
-        await bot.telegram.sendMessage(Number(s.chat_id), text, { parse_mode: "Markdown" });
-      } catch (e) {
-        console.error("auto notify fail", s.chat_id, e.message);
+  // Автоуведомления в фиксированные часы (по Киеву 11:00,15:00,19:00,23:00 => по UTC 08:00,12:00,16:00,20:00)
+  // ВАЖНО: этот блок должен быть внутри registerCardFlow(bot), чтобы bot был доступен.
+  const CRON_RULE_UTC = '0 8,12,16,20 * * *';
+
+  nodeSchedule.scheduleJob(CRON_RULE_UTC, async () => {
+    try {
+      const text = await computeStatusText();
+      const subs = await listSubs();
+      for (const s of subs) {
+        try {
+          await bot.telegram.sendMessage(Number(s.chat_id), text, { parse_mode: "Markdown" });
+        } catch (e) {
+          console.error("auto notify fail", s.chat_id, e?.message || e);
+        }
       }
+    } catch (e) {
+      console.error("auto notify error", e?.message || e);
     }
-  } catch (e) {
-    console.error("auto notify error", e);
-  }
-});
+  });
+} // ← это закрывающая скобка функции registerCardFlow(bot)
+
