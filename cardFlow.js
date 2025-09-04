@@ -400,4 +400,5 @@ async function testReadMainCards() {
 
 // Вызов теста при старте
 testReadMainCards();
+console.log("📑 Листы:", SHEET_NAMES);
 
