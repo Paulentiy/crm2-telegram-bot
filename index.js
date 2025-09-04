@@ -383,34 +383,40 @@ bot.hears('↩️ Отменить последнюю', async ctx=>{
 
 bot.hears('ℹ️ Помощь', ctx=>ctx.reply(HELP_TEXT, mainKeyboard()));
 
-// ===== Server start (webhook/polling) =====
+/** ====== SERVER START ====== **/
 const app = express();
 app.get('/health', (_, res) => res.send('ok'));
 const PORT = process.env.PORT || 3000;
 
 (async () => {
   try {
-    // Сначала убираем возможный старый вебхук и отбрасываем висящие апдейты,
-    // чтобы избежать 409 Conflict при старте.
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    // 1) На всякий случай снимаем любой вебхук (+ дропаем подвисшие апдейты)
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
 
     if (WEBHOOK_BASE_URL) {
+      // === webhook-режим ===
       const path = '/tg-webhook';
-      app.use(express.json());
-      app.post(path, bot.webhookCallback(path));
+      app.post(path, express.json(), (req, res) => bot.webhookCallback(path)(req, res));
+
+      // Ставим вебхук на наш URL
       await bot.telegram.setWebhook(`${WEBHOOK_BASE_URL}${path}`);
+
       app.listen(PORT, () =>
         console.log('Bot via webhook on', PORT, 'url:', `${WEBHOOK_BASE_URL}${path}`)
       );
     } else {
-      await bot.launch({ dropPendingUpdates: true });
+      // === long polling ===
+      await bot.launch({
+        dropPendingUpdates: true,               // ещё раз гарантируем сброс очереди
+        allowedUpdates: ['message','callback_query'] // (не обязательно, но аккуратнее)
+      });
       app.listen(PORT, () => console.log('Bot via long polling on', PORT));
     }
-
-    process.once('SIGINT', () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
   } catch (e) {
     console.error('Bot start error:', e);
-    process.exit(1);
+    process.exit(1); // пусть Railway перезапустит
   }
+
+  process.once('SIGINT', () => bot.stop('SIGINT'));
+  process.once('SIGTERM', () => bot.stop('SIGTERM'));
 })();
