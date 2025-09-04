@@ -338,20 +338,19 @@ export function registerCardFlow(bot) {
     }
   });
 
-  // Автоуведомления всем подписчикам каждые N минут
-  nodeSchedule.scheduleJob(`*/${CHECK_INTERVAL_MIN} * * * *`, async () => {
-    try {
-      const text = await computeStatusText();
-      const subs = await listSubs();
-      for (const s of subs) {
-        try {
-          await bot.telegram.sendMessage(Number(s.chat_id), text, { parse_mode: "Markdown" });
-        } catch (e) {
-          console.error("auto notify fail", s.chat_id, e.message);
-        }
+// Автоуведомления в 11:00, 15:00, 19:00, 23:00 по Киеву (UTC+3) => 08:00, 12:00, 16:00, 20:00 UTC
+nodeSchedule.scheduleJob('0 8,12,16,20 * * *', async () => {
+  try {
+    const text = await computeStatusText();
+    const subs = await listSubs();
+    for (const s of subs) {
+      try {
+        await bot.telegram.sendMessage(Number(s.chat_id), text, { parse_mode: "Markdown" });
+      } catch (e) {
+        console.error("auto notify fail", s.chat_id, e.message);
       }
-    } catch (e) {
-      console.error("auto notify error", e);
     }
-  });
-}
+  } catch (e) {
+    console.error("auto notify error", e);
+  }
+});
