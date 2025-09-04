@@ -373,3 +373,31 @@ export function registerCardFlow(bot) {
     }
   });
 }
+
+// ===== ТЕСТ ЧТЕНИЯ ТАБЛИЦЫ =====
+async function testReadMainCards() {
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials: JSON.parse(
+        Buffer.from(SA_B64, "base64").toString("utf8")
+      ),
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+
+    const sheets = google.sheets({ version: "v4", auth });
+
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `${SHEET_NAMES.main}!A1:J3`, // первые 3 строки из "Основные карты"
+    });
+
+    console.log("=== TEST READ ===");
+    console.log(res.data.values);
+  } catch (e) {
+    console.error("Ошибка при тестовом чтении:", e.message, e);
+  }
+}
+
+// Вызов теста при старте
+testReadMainCards();
+
