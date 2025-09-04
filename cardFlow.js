@@ -11,10 +11,14 @@ const SA_B64   = process.env.GOOGLE_SERVICE_ACCOUNT_B64;
 const THRESHOLD_SLOTS       = parseInt(process.env.THRESHOLD_SLOTS ?? "3", 10);
 const THRESHOLD_BUFFER_FREE = parseInt(process.env.THRESHOLD_BUFFER_FREE ?? "5", 10);
 
-const SHEET_NAMES = JSON.parse(
-  process.env.SHEET_NAMES_JSON ||
-  '{"dashboard":"Дашборд","main":"Основные карты","buffer":"Буферные карты","ar":"Автореги","reissue":"Перевыпуски","settings":"Settings"}'
-);
+const SHEET_NAMES = {
+  dashboard: "Дашборд",
+  main: "Основные карты",
+  buffer: "Буферные карты",
+  ar: "Автореги",
+  reissue: "Перевыпуски",
+  settings: "Settings"
+};
 
 /* ===== Google Sheets client ===== */
 const auth = new google.auth.GoogleAuth({
