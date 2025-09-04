@@ -5,7 +5,7 @@ import nodeSchedule from "node-schedule";
 import { Markup } from "telegraf";
 
 /* ===== ENV ===== */
-const SHEET_ID = process.env.SPREADSHEET_ID;            // ID таблицы Card_Flow_Manager (или общий, если один)
+const SHEET_ID = process.env.CARDS_SPREADSHEET_ID || process.env.SPREADSHEET_ID;           // ID таблицы Card_Flow_Manager (или общий, если один)
 const SA_B64   = process.env.GOOGLE_SERVICE_ACCOUNT_B64;
 
 const THRESHOLD_SLOTS       = parseInt(process.env.THRESHOLD_SLOTS ?? "3", 10);
