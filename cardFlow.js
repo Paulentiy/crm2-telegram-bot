@@ -1,265 +1,205 @@
-// cardFlow.js
+// cardFlow.js — блок "Карты" для CRM2 бота
 
 import { google } from "googleapis";
 import nodeSchedule from "node-schedule";
 import { Markup } from "telegraf";
 
 /* ===== ENV ===== */
-const SHEET_ID = process.env.CARDS_SPREADSHEET_ID || process.env.SPREADSHEET_ID; // ID таблицы Card_Flow_Manager (или общий, если один)
+const SHEET_ID = process.env.CARDS_SPREADSHEET_ID || process.env.SPREADSHEET_ID; // ID таблицы Card_Flow_Manager
 const SA_B64   = process.env.GOOGLE_SERVICE_ACCOUNT_B64;
 
-const THRESHOLD_SLOTS       = parseInt(process.env.THRESHOLD_SLOTS ?? "3", 10);
-const THRESHOLD_BUFFER_FREE = parseInt(process.env.THRESHOLD_BUFFER_FREE ?? "5", 10);
+if (!SHEET_ID) throw new Error("cardFlow: missing CARDS_SPREADSHEET_ID / SPREADSHEET_ID");
+if (!SA_B64)   throw new Error("cardFlow: missing GOOGLE_SERVICE_ACCOUNT_B64");
 
 const SHEET_NAMES = JSON.parse(
   process.env.SHEET_NAMES_JSON ||
-  '{"dashboard":"Дашборд","main":"Основные карты","buffer":"Буферные карты","ar":"Автореги","reissue":"Перевыпуски","settings":"Settings"}'
+    '{"dashboard":"Дашборд","main":"Основные карты","buffer":"Буферные карты","ar":"Автореги","reissue":"Перевыпуски","settings":"Settings"}'
 );
 
 /* ===== Google Sheets client ===== */
-const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(Buffer.from(SA_B64, "base64").toString("utf-8")),
-  scopes: [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-  ],
-});
+const svc = JSON.parse(Buffer.from(SA_B64, "base64").toString("utf8"));
+const auth = new google.auth.JWT(
+  svc.client_email,
+  null,
+  svc.private_key,
+  ["https://www.googleapis.com/auth/spreadsheets"]
+);
 const sheets = google.sheets({ version: "v4", auth });
 
-/* ===== helpers ===== */
-async function readSheet(title) {
-  const range = `'${title}'!A1:Z2000`;
-  try {
-    const { data } = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range,
-    });
-    const [header = [], ...rows] = data.values ?? [];
-    return { header, rows };
-  } catch (e) {
-    console.error("readSheet error:", title, e?.response?.data || e?.message || e);
-    return { header: [], rows: [] };
+/* ===== Mini cache ===== */
+const mem = new Map();
+const setMem = (k, v, ms = 60_000) => mem.set(k, { v, exp: Date.now() + ms });
+const getMem = (k) => {
+  const it = mem.get(k);
+  if (!it || Date.now() > it.exp) {
+    mem.delete(k);
+    return null;
   }
-}
-function safeIdx(header, name) {
-  const i = header.indexOf(name);
-  return i >= 0 ? i : null;
+  return it.v;
+};
+
+/* ===== Settings / Admins / Subs ===== */
+const SETTINGS_SHEET = SHEET_NAMES.settings || "Settings";
+
+/** Читаем все строки Settings: A chat_id, B username, E is_admin, (опц.) F subscribed */
+async function readSettings() {
+  const cached = getMem("settings");
+  if (cached) return cached;
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SETTINGS_SHEET}!A2:H`,
+  });
+
+  const list = (res.data.values || []).map((r) => ({
+    chat_id: String(r[0] || "").trim(),
+    username: String(r[1] || "").trim(),
+    // C,D нам не нужны тут
+    admin: /^true$/i.test(String(r[4] || "")),      // E
+    subscribed: r[5] == null ? true : /^true$/i.test(String(r[5])), // F (если колонки нет — считаем подписан)
+  }));
+
+  setMem("settings", list, 60_000);
+  return list;
 }
 
-/* ===== Settings: подписчики ===== */
-async function ensureSettingsSheet() {
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
-  const exists = (meta.data.sheets || []).some(
-    (s) => s.properties?.title === SHEET_NAMES.settings
-  );
-  if (!exists) {
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: SHEET_ID,
-      requestBody: {
-        requests: [{ addSheet: { properties: { title: SHEET_NAMES.settings } } }],
-      },
-    });
-  }
-  const { header } = await readSheet(SHEET_NAMES.settings);
-  if (!header.length) {
+async function isAdmin(chatId) {
+  const me = String(chatId);
+  const rows = await readSettings();
+  return rows.some((r) => r.chat_id === me && r.admin);
+}
+
+/** Список подписчиков (учитываем F=subscribed если есть) */
+async function listSubs() {
+  const rows = await readSettings();
+  return rows.filter((r) => r.subscribed && r.chat_id);
+}
+
+/** Подписаться: если есть строка — просто отметим F=TRUE, иначе добавим новую */
+async function upsertSub(chatId, username = "") {
+  const all = await readSettings();
+  const me = String(chatId);
+  const idx = all.findIndex((r) => r.chat_id === me);
+
+  if (idx >= 0) {
+    // включим подписку в колонке F, не трогая is_admin (E)
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
-      range: `'${SHEET_NAMES.settings}'!A1:E1`,
+      range: `${SETTINGS_SHEET}!F${idx + 2}`,
       valueInputOption: "RAW",
-      requestBody: {
-        values: [[
-          "chat_id",
-          "username",
-          "threshold_slots",
-          "threshold_buffer_free",
-          "is_admin",
-        ]],
-      },
+      requestBody: { values: [["TRUE"]] },
     });
+    mem.delete("settings");
+    return;
   }
+
+  // добавим новую строку: chat_id, username, -, -, -, subscribed=TRUE
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${SETTINGS_SHEET}!A:F`,
+    valueInputOption: "RAW",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: { values: [[me, username || "", "", "", "", "TRUE"]] },
+  });
+  mem.delete("settings");
 }
 
-async function listSubs() {
-  await ensureSettingsSheet();
-  const { header, rows } = await readSheet(SHEET_NAMES.settings);
-  const iChat = header.indexOf("chat_id");
-  const iUser = header.indexOf("username");
-  const iTS   = header.indexOf("threshold_slots");
-  const iTB   = header.indexOf("threshold_buffer_free");
-  const iAdm  = header.indexOf("is_admin");
+/** Отписаться: ставим F=FALSE (если нет колонки — оставляем строку как есть) */
+async function removeSub(chatId) {
+  const all = await readSettings();
+  const me = String(chatId);
+  const idx = all.findIndex((r) => r.chat_id === me);
+  if (idx < 0) return;
 
-  const out = [];
-  for (const r of rows) {
-    const chat_id = r[iChat];
-    if (!chat_id) continue;
-    out.push({
-      chat_id: String(chat_id),
-      username: r[iUser] || "",
-      ts: parseInt(r[iTS] || THRESHOLD_SLOTS, 10),
-      tb: parseInt(r[iTB] || THRESHOLD_BUFFER_FREE, 10),
-      admin: String(r[iAdm] || "").toLowerCase() === "true",
-    });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `${SETTINGS_SHEET}!F${idx + 2}`,
+    valueInputOption: "RAW",
+    requestBody: { values: [["FALSE"]] },
+  });
+  mem.delete("settings");
+}
+
+/* ===== Быстрые метрики / текст статуса ===== */
+const MAIN_SHEET   = SHEET_NAMES.main   || "Основные карты";
+const BUFFER_SHEET = SHEET_NAMES.buffer || "Буферные карты";
+
+async function quickStats() {
+  const cacheKey = "quick";
+  const c = getMem(cacheKey);
+  if (c) return c;
+
+  // Основные: D "Слоты всего", E "Слоты занято", G "Холды $", I "Статус"
+  const mainRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${MAIN_SHEET}!A2:K`,
+  });
+  const main = mainRes.data.values || [];
+
+  let totalSlots = 0;
+  let usedSlots = 0;
+  let holds = 0;
+  let reissue = 0;
+
+  for (const r of main) {
+    const dTotal = Number(r[3] || 0); // D
+    const dUsed  = Number(r[4] || 0); // E
+    const h      = Number(String(r[6] || "0").replace(",", ".")); // G
+    const status = String(r[8] || "").trim(); // I
+
+    if (!isNaN(dTotal)) totalSlots += dTotal;
+    if (!isNaN(dUsed))  usedSlots  += dUsed;
+    if (!isNaN(h))      holds      += h;
+    if (/^к\s*перевыпуску$/i.test(status)) reissue += 1;
   }
+  const freeSlots = Math.max(0, totalSlots - usedSlots);
+
+  // Буферные: E "Статус" => Свободна
+  const bufRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${BUFFER_SHEET}!A2:G`,
+  });
+  const buf = bufRes.data.values || [];
+  let freeBuffer = 0;
+  for (const r of buf) {
+    const st = String(r[4] || "").trim(); // E
+    if (/^свободна$/i.test(st)) freeBuffer += 1;
+  }
+
+  const out = { freeSlots, freeBuffer, holds, reissue };
+  setMem(cacheKey, out, 60_000);
   return out;
 }
 
-async function upsertSub(chatId, username) {
-  await ensureSettingsSheet();
-  const { header, rows } = await readSheet(SHEET_NAMES.settings);
-  const iChat = header.indexOf("chat_id");
-  let   iUser = header.indexOf("username");
+async function computeStatusText() {
+  const { freeSlots, freeBuffer, holds, reissue } = await quickStats();
 
-  // если нет колонки username — создадим в B1
-  if (iUser === -1) {
-    iUser = 1; // колонка B
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range: `'${SHEET_NAMES.settings}'!B1`,
-      valueInputOption: "RAW",
-      requestBody: { values: [["username"]] },
-    });
-  }
+  const warnParts = [];
+  if (freeSlots < 3)  warnParts.push(`Мало свободных слотов: ${freeSlots} (< 3)`);
+  if (freeBuffer < 5) warnParts.push(`Мало свободных буферок: ${freeBuffer} (< 5)`);
 
-  let rowIndex = -1; // 1-based
-  rows.forEach((r, i) => {
-    if (String(r[iChat]) === String(chatId)) rowIndex = i + 2;
-  });
-  const colUser = String.fromCharCode("A".charCodeAt(0) + iUser);
+  const warnLine = warnParts.length
+    ? `\n⚠️ ${warnParts.join(" | ")}`
+    : "";
 
-  if (rowIndex === -1) {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: `'${SHEET_NAMES.settings}'!A1`,
-      valueInputOption: "RAW",
-      requestBody: {
-        values: [[String(chatId), username || "", "", "", ""]],
-      },
-    });
-  } else {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range: `'${SHEET_NAMES.settings}'!${colUser}${rowIndex}`,
-      valueInputOption: "RAW",
-      requestBody: { values: [[username || ""]] },
-    });
-  }
+  const tips = (freeSlots === 0 && freeBuffer === 0 && holds === 0)
+    ? "\nℹ️ Таблица пустая — считаю нули. Можно начинать заполнять листы."
+    : "";
+
+  return [
+    "📊 *Статус карт*",
+    `Свободные слоты: *${freeSlots}*`,
+    `Свободные буферки: *${freeBuffer}*`,
+    `Зависшие холды: *$${holds.toFixed(2)}*`,
+    `Карт к перевыпуску: *${reissue}*`,
+    warnLine,
+    tips
+  ].join("\n");
 }
 
-async function removeSub(chatId) {
-  await ensureSettingsSheet();
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
-  const sheet = meta.data.sheets.find(
-    (s) => s.properties.title === SHEET_NAMES.settings
-  );
-  const sheetId = sheet.properties.sheetId;
-
-  const { header, rows } = await readSheet(SHEET_NAMES.settings);
-  const iChat = header.indexOf("chat_id");
-
-  for (let i = 0; i < rows.length; i++) {
-    if (String(rows[i][iChat]) === String(chatId)) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: SHEET_ID,
-        requestBody: {
-          requests: [
-            {
-              deleteDimension: {
-                range: { sheetId, dimension: "ROWS", startIndex: i + 1, endIndex: i + 2 },
-              },
-            },
-          ],
-        },
-      });
-      break;
-    }
-  }
-}
-
-/* ===== Быстрые метрики ===== */
-async function quickStats() {
-  // Основные карты
-  const main = await readSheet(SHEET_NAMES.main);
-  const iTotal = safeIdx(main.header, "Слоты всего");
-  const iUsed  = safeIdx(main.header, "Слоты занято");
-  const iHold  = safeIdx(main.header, "Холды $");
-  const iStat  = safeIdx(main.header, "Статус");
-
-  let freeSlots = 0, sumHolds = 0, reissue = 0;
-  if (main.rows.length && iTotal !== null && iUsed !== null) {
-    for (const r of main.rows) {
-      const total = parseInt(r[iTotal] || "0", 10);
-      const used  = parseInt(r[iUsed]  || "0", 10);
-      freeSlots  += Math.max(total - used, 0);
-      if (iHold !== null) sumHolds += parseFloat(String(r[iHold] || "0").replace(",", "."));
-      if (iStat !== null) {
-        const st = String(r[iStat] || "").trim();
-        // считаем карты, которые требуют перевыпуска/в процессе перевыпуска
-        if (["К перевыпуску", "В процессе"].includes(st)) reissue++;
-      }
-    }
-  }
-
-  // Буферные карты
-  const buf = await readSheet(SHEET_NAMES.buffer);
-  const iBufStatus = safeIdx(buf.header, "Статус");
-  const freeBuffer = (buf.rows.length && iBufStatus !== null)
-    ? buf.rows.filter(r => String(r[iBufStatus] || "").trim() === "Свободна").length
-    : 0;
-
-  return { freeSlots, sumHolds: +sumHolds.toFixed(2), freeBuffer, reissue };
-}
-
-/* ===== Статус (подробный текст) ===== */
-export async function computeStatusText() {
-  const main = await readSheet(SHEET_NAMES.main);
-  const iTotal = safeIdx(main.header, "Слоты всего");
-  const iUsed  = safeIdx(main.header, "Слоты занято");
-  const iHold  = safeIdx(main.header, "Холды $");
-  const iStat  = safeIdx(main.header, "Статус");
-
-  let freeSlots = 0, sumHolds = 0, reissue = 0;
-  if (main.rows.length && iTotal !== null && iUsed !== null) {
-    for (const r of main.rows) {
-      const total = parseInt(r[iTotal] || "0", 10);
-      const used  = parseInt(r[iUsed]  || "0", 10);
-      freeSlots  += Math.max(total - used, 0);
-      if (iHold !== null) sumHolds += parseFloat(String(r[iHold] || "0").replace(",", "."));
-      if (iStat !== null) {
-        const st = String(r[iStat] || "").trim();
-        if (["К перевыпуску", "В процессе"].includes(st)) reissue++;
-      }
-    }
-  }
-
-  const buffer     = await readSheet(SHEET_NAMES.buffer);
-  const iBufStatus = safeIdx(buffer.header, "Статус");
-  const freeBuffer = (buffer.rows.length && iBufStatus !== null)
-    ? buffer.rows.filter(r => String(r[iBufStatus] || "").trim() === "Свободна").length
-    : 0;
-
-  const alerts = [];
-  if (freeSlots  < THRESHOLD_SLOTS)
-    alerts.push(`Мало свободных слотов: ${freeSlots} (< ${THRESHOLD_SLOTS})`);
-  if (freeBuffer < THRESHOLD_BUFFER_FREE)
-    alerts.push(`Мало свободных буферок: ${freeBuffer} (< ${THRESHOLD_BUFFER_FREE})`);
-
-  let text =
-    `📊 *Статус карт*\n` +
-    `Свободные слоты: *${freeSlots}*\n` +
-    `Свободные буферки: *${freeBuffer}*\n` +
-    `Зависшие холды: *$${sumHolds.toFixed(2)}*\n` +
-    `Карт к перевыпуску: *${reissue}*`;
-
-  if (alerts.length) text += `\n\n⚠️ ${alerts.join(" | ")}`;
-  if (!main.rows.length && !buffer.rows.length) {
-    text += `\n\nℹ️ Таблица пустая — считаю нули. Можно начинать заполнять листы.`;
-  }
-  return text;
-}
-
-/* ===== Telegraf integration (меню «Карты») ===== */
+/* ===== Меню и обработчики ===== */
 export function registerCardFlow(bot) {
-  const menu = () =>
+  const baseMenu = () =>
     Markup.inlineKeyboard([
       [Markup.button.callback("📊 Статус", "cards:status")],
       [Markup.button.callback("🔔 Подписаться", "cards:sub"), Markup.button.callback("🔕 Отписаться", "cards:unsub")],
@@ -268,65 +208,81 @@ export function registerCardFlow(bot) {
       [Markup.button.callback("⬅️ Закрыть", "cards:close")],
     ]);
 
-  // Главная кнопка в клавиатуре
+  const adminMenu = () =>
+    Markup.inlineKeyboard([
+      [Markup.button.callback("📊 Статус", "cards:status")],
+      [Markup.button.callback("⚡ Проверить сейчас", "cards:checknow")],
+      [Markup.button.callback("🧩 Слоты", "cards:slots"), Markup.button.callback("🧩 Буферки", "cards:buffers"), Markup.button.callback("🧩 Перевыпуск", "cards:reissue")],
+      [Markup.button.callback("⬅️ Закрыть", "cards:close")],
+    ]);
+
+  // Главная кнопка «Карты»
   bot.hears("💳 Карты", async (ctx) => {
-    await ctx.reply("Выбери действие по картам:", menu());
+    await ctx.reply("Выбери действие по картам:", baseMenu());
+
+    // админский блок — только админам
+    if (await isAdmin(ctx.chat.id)) {
+      await ctx.reply("Только для админов.", adminMenu());
+    }
   });
 
   // Статус
   bot.action("cards:status", async (ctx) => {
     await ctx.answerCbQuery();
     const text = await computeStatusText();
-    await ctx.editMessageText(text, { parse_mode: "Markdown", ...menu() });
+    try {
+      await ctx.editMessageText(text, { parse_mode: "Markdown", ...baseMenu() });
+    } catch {
+      await ctx.reply(text, { parse_mode: "Markdown", ...baseMenu() });
+    }
   });
 
   // Подписка / Отписка
   bot.action("cards:sub", async (ctx) => {
     await ctx.answerCbQuery();
     await upsertSub(ctx.chat.id, ctx.from?.username || "");
-    await ctx.reply("Подписал на автоуведомления ✅", menu());
+    await ctx.reply("Подписал на автоуведомления ✅", baseMenu());
   });
 
   bot.action("cards:unsub", async (ctx) => {
     await ctx.answerCbQuery();
     await removeSub(ctx.chat.id);
-    await ctx.reply("Отписал от автоуведомлений ✅", menu());
+    await ctx.reply("Отписал от автоуведомлений ✅", baseMenu());
   });
 
-  // Ручная рассылка (только админ)
+  // Ручная рассылка — только админам
   bot.action("cards:checknow", async (ctx) => {
     await ctx.answerCbQuery();
-    const subs = await listSubs();
-    const me = String(ctx.chat.id);
-    const isAdmin = subs.some((s) => s.chat_id === me && s.admin);
-    if (!isAdmin) return ctx.reply("Только для админов.", menu());
-
+    if (!(await isAdmin(ctx.chat.id))) {
+      return ctx.reply("Только для админов.", baseMenu());
+    }
     const text = await computeStatusText();
+    const subs = await listSubs();
     for (const s of subs) {
       try {
         await ctx.telegram.sendMessage(Number(s.chat_id), text, { parse_mode: "Markdown" });
       } catch (e) {
-        console.error("send fail", s.chat_id, e.message);
+        console.error("auto send fail", s.chat_id, e?.message || e);
       }
     }
-    await ctx.reply("Разослал ✅", menu());
+    await ctx.reply("Разослал ✅");
   });
 
-  // Быстрые метрики (кнопки)
+  // Быстрые метрики
   bot.action("cards:slots", async (ctx) => {
     await ctx.answerCbQuery();
     const { freeSlots } = await quickStats();
-    await ctx.reply(`Свободные слоты: *${freeSlots}*`, { parse_mode: "Markdown", ...menu() });
+    await ctx.reply(`Свободные слоты: *${freeSlots}*`, { parse_mode: "Markdown" });
   });
   bot.action("cards:buffers", async (ctx) => {
     await ctx.answerCbQuery();
     const { freeBuffer } = await quickStats();
-    await ctx.reply(`Свободные буферки: *${freeBuffer}*`, { parse_mode: "Markdown", ...menu() });
+    await ctx.reply(`Свободные буферки: *${freeBuffer}*`, { parse_mode: "Markdown" });
   });
   bot.action("cards:reissue", async (ctx) => {
     await ctx.answerCbQuery();
     const { reissue } = await quickStats();
-    await ctx.reply(`Карт к перевыпуску: *${reissue}*`, { parse_mode: "Markdown", ...menu() });
+    await ctx.reply(`Карт к перевыпуску: *${reissue}*`, { parse_mode: "Markdown" });
   });
 
   bot.action("cards:close", async (ctx) => {
@@ -334,19 +290,10 @@ export function registerCardFlow(bot) {
     try { await ctx.editMessageText("Меню закрыто."); } catch {}
   });
 
-  // Оставим /status на всякий
-  bot.command("status", async (ctx) => {
-    try {
-      const text = await computeStatusText();
-      await ctx.reply(text, { parse_mode: "Markdown" });
-    } catch (e) {
-      console.error(e);
-      await ctx.reply("Ошибка при получении статуса ❌");
-    }
-  });
-
-  // Автоуведомления в фиксированные часы (по Киеву 11:00,15:00,19:00,23:00 => по UTC 08:00,12:00,16:00,20:00)
+  /* ===== Автоуведомления по расписанию =====
+     Киев 11:00, 15:00, 19:00, 23:00  => UTC 08:00, 12:00, 16:00, 20:00 */
   const CRON_RULE_UTC = "0 8,12,16,20 * * *";
+
   nodeSchedule.scheduleJob(CRON_RULE_UTC, async () => {
     try {
       const text = await computeStatusText();
