@@ -5,20 +5,16 @@ import nodeSchedule from "node-schedule";
 import { Markup } from "telegraf";
 
 /* ===== ENV ===== */
-const SHEET_ID = process.env.CARDS_SPREADSHEET_ID || process.env.SPREADSHEET_ID;           // ID таблицы Card_Flow_Manager (или общий, если один)
+const SHEET_ID = process.env.CARDS_SPREADSHEET_ID || process.env.SPREADSHEET_ID; // ID таблицы Card_Flow_Manager (или общий, если один)
 const SA_B64   = process.env.GOOGLE_SERVICE_ACCOUNT_B64;
 
 const THRESHOLD_SLOTS       = parseInt(process.env.THRESHOLD_SLOTS ?? "3", 10);
 const THRESHOLD_BUFFER_FREE = parseInt(process.env.THRESHOLD_BUFFER_FREE ?? "5", 10);
 
-const SHEET_NAMES = {
-  dashboard: "Дашборд",
-  main: "Основные карты",
-  buffer: "Буферные карты",
-  ar: "Автореги",
-  reissue: "Перевыпуски",
-  settings: "Settings"
-};
+const SHEET_NAMES = JSON.parse(
+  process.env.SHEET_NAMES_JSON ||
+  '{"dashboard":"Дашборд","main":"Основные карты","buffer":"Буферные карты","ar":"Автореги","reissue":"Перевыпуски","settings":"Settings"}'
+);
 
 /* ===== Google Sheets client ===== */
 const auth = new google.auth.GoogleAuth({
@@ -40,7 +36,8 @@ async function readSheet(title) {
     });
     const [header = [], ...rows] = data.values ?? [];
     return { header, rows };
-  } catch {
+  } catch (e) {
+    console.error("readSheet error:", title, e?.response?.data || e?.message || e);
     return { header: [], rows: [] };
   }
 }
@@ -51,7 +48,6 @@ function safeIdx(header, name) {
 
 /* ===== Settings: подписчики ===== */
 async function ensureSettingsSheet() {
-  // есть ли лист
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
   const exists = (meta.data.sheets || []).some(
     (s) => s.properties?.title === SHEET_NAMES.settings
@@ -64,7 +60,6 @@ async function ensureSettingsSheet() {
       },
     });
   }
-  // есть ли заголовки
   const { header } = await readSheet(SHEET_NAMES.settings);
   if (!header.length) {
     await sheets.spreadsheets.values.update({
@@ -180,7 +175,7 @@ async function removeSub(chatId) {
   }
 }
 
-/* ===== Быстрые метрики (с новой логикой статуса) ===== */
+/* ===== Быстрые метрики ===== */
 async function quickStats() {
   // Основные карты
   const main = await readSheet(SHEET_NAMES.main);
@@ -195,15 +190,11 @@ async function quickStats() {
       const total = parseInt(r[iTotal] || "0", 10);
       const used  = parseInt(r[iUsed]  || "0", 10);
       freeSlots  += Math.max(total - used, 0);
-
-      if (iHold !== null) {
-        const v = String(r[iHold] || "0").replace(",", ".");
-        const num = parseFloat(v);
-        if (!isNaN(num)) sumHolds += num;
-      }
+      if (iHold !== null) sumHolds += parseFloat(String(r[iHold] || "0").replace(",", "."));
       if (iStat !== null) {
         const st = String(r[iStat] || "").trim();
-        if (st === "К перевыпуску" || st === "Перевыпуск") reissue++; // back-compat
+        // считаем карты, которые требуют перевыпуска/в процессе перевыпуска
+        if (["К перевыпуску", "В процессе"].includes(st)) reissue++;
       }
     }
   }
@@ -232,15 +223,10 @@ export async function computeStatusText() {
       const total = parseInt(r[iTotal] || "0", 10);
       const used  = parseInt(r[iUsed]  || "0", 10);
       freeSlots  += Math.max(total - used, 0);
-
-      if (iHold !== null) {
-        const v = String(r[iHold] || "0").replace(",", ".");
-        const num = parseFloat(v);
-        if (!isNaN(num)) sumHolds += num;
-      }
+      if (iHold !== null) sumHolds += parseFloat(String(r[iHold] || "0").replace(",", "."));
       if (iStat !== null) {
         const st = String(r[iStat] || "").trim();
-        if (st === "К перевыпуску" || st === "Перевыпуск") reissue++;
+        if (["К перевыпуску", "В процессе"].includes(st)) reissue++;
       }
     }
   }
@@ -282,7 +268,7 @@ export function registerCardFlow(bot) {
       [Markup.button.callback("⬅️ Закрыть", "cards:close")],
     ]);
 
-  // Главная кнопка
+  // Главная кнопка в клавиатуре
   bot.hears("💳 Карты", async (ctx) => {
     await ctx.reply("Выбери действие по картам:", menu());
   });
@@ -320,13 +306,13 @@ export function registerCardFlow(bot) {
       try {
         await ctx.telegram.sendMessage(Number(s.chat_id), text, { parse_mode: "Markdown" });
       } catch (e) {
-        console.error("send fail", s.chat_id, e?.message || e);
+        console.error("send fail", s.chat_id, e.message);
       }
     }
     await ctx.reply("Разослал ✅", menu());
   });
 
-  // Быстрые метрики
+  // Быстрые метрики (кнопки)
   bot.action("cards:slots", async (ctx) => {
     await ctx.answerCbQuery();
     const { freeSlots } = await quickStats();
@@ -348,7 +334,7 @@ export function registerCardFlow(bot) {
     try { await ctx.editMessageText("Меню закрыто."); } catch {}
   });
 
-  // /status на всякий
+  // Оставим /status на всякий
   bot.command("status", async (ctx) => {
     try {
       const text = await computeStatusText();
@@ -359,8 +345,8 @@ export function registerCardFlow(bot) {
     }
   });
 
-  // Автоуведомления в 11:00, 15:00, 19:00, 23:00 по Киеву (UTC -> 08,12,16,20)
-  const CRON_RULE_UTC = '0 8,12,16,20 * * *';
+  // Автоуведомления в фиксированные часы (по Киеву 11:00,15:00,19:00,23:00 => по UTC 08:00,12:00,16:00,20:00)
+  const CRON_RULE_UTC = "0 8,12,16,20 * * *";
   nodeSchedule.scheduleJob(CRON_RULE_UTC, async () => {
     try {
       const text = await computeStatusText();
@@ -377,32 +363,3 @@ export function registerCardFlow(bot) {
     }
   });
 }
-
-// ===== ТЕСТ ЧТЕНИЯ ТАБЛИЦЫ =====
-async function testReadMainCards() {
-  try {
-    const auth = new google.auth.GoogleAuth({
-      credentials: JSON.parse(
-        Buffer.from(SA_B64, "base64").toString("utf8")
-      ),
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-    });
-
-    const sheets = google.sheets({ version: "v4", auth });
-
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: `${SHEET_NAMES.main}!A1:J3`, // первые 3 строки из "Основные карты"
-    });
-
-    console.log("=== TEST READ ===");
-    console.log(res.data.values);
-  } catch (e) {
-    console.error("Ошибка при тестовом чтении:", e.message, e);
-  }
-}
-
-// Вызов теста при старте
-testReadMainCards();
-console.log("📑 Листы:", SHEET_NAMES);
-
