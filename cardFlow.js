@@ -5,17 +5,11 @@ import nodeSchedule from "node-schedule";
 import { Markup } from "telegraf";
 
 /* ===== ENV ===== */
-// Таблица с данными по картам (Дашборд, Основные/Буферные и т.п.)
-const CARDS_SHEET_ID =
-  process.env.CARDS_SPREADSHEET_ID || process.env.SPREADSHEET_ID;
-// Таблица, где находится лист Settings (админы/подписки) — это твоя основная
-const SETTINGS_SHEET_ID = process.env.SPREADSHEET_ID;
+const SHEET_ID = process.env.CARDS_SPREADSHEET_ID || process.env.SPREADSHEET_ID; // ID таблицы Card_Flow_Manager
+const SA_B64   = process.env.GOOGLE_SERVICE_ACCOUNT_B64;
 
-const SA_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_B64;
-
-if (!CARDS_SHEET_ID) throw new Error("cardFlow: missing CARDS_SPREADSHEET_ID / SPREADSHEET_ID");
-if (!SETTINGS_SHEET_ID) throw new Error("cardFlow: missing SPREADSHEET_ID for Settings");
-if (!SA_B64) throw new Error("cardFlow: missing GOOGLE_SERVICE_ACCOUNT_B64");
+if (!SHEET_ID) throw new Error("cardFlow: missing CARDS_SPREADSHEET_ID / SPREADSHEET_ID");
+if (!SA_B64)   throw new Error("cardFlow: missing GOOGLE_SERVICE_ACCOUNT_B64");
 
 const SHEET_NAMES = JSON.parse(
   process.env.SHEET_NAMES_JSON ||
@@ -47,23 +41,21 @@ const getMem = (k) => {
 /* ===== Settings / Admins / Subs ===== */
 const SETTINGS_SHEET = SHEET_NAMES.settings || "Settings";
 
-/** Читаем все строки Settings основной таблицы
- * A chat_id | B username | C threshold_slots | D threshold_buffer_free | E is_admin | F subscribed?
- */
+/** Читаем все строки Settings: A chat_id, B username, E is_admin, (опц.) F subscribed */
 async function readSettings() {
   const cached = getMem("settings");
   if (cached) return cached;
 
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SETTINGS_SHEET_ID,
+    spreadsheetId: SHEET_ID,
     range: `${SETTINGS_SHEET}!A2:H`,
   });
 
   const list = (res.data.values || []).map((r) => ({
     chat_id: String(r[0] || "").trim(),
     username: String(r[1] || "").trim(),
-    admin: /^true$/i.test(String(r[4] || "")), // E
-    subscribed: r[5] == null ? true : /^true$/i.test(String(r[5])), // F, по умолчанию TRUE
+    admin: /^true$/i.test(String(r[4] || "")),               // E
+    subscribed: r[5] == null ? true : /^true$/i.test(String(r[5])), // F (если нет — считаем подписан)
   }));
 
   setMem("settings", list, 60_000);
@@ -82,16 +74,15 @@ async function listSubs() {
   return rows.filter((r) => r.subscribed && r.chat_id);
 }
 
-/** Подписаться: если есть строка — ставим F=TRUE, иначе добавляем новую */
+/** Подписаться: если есть строка — просто включаем F=TRUE, иначе добавляем новую */
 async function upsertSub(chatId, username = "") {
   const all = await readSettings();
   const me = String(chatId);
   const idx = all.findIndex((r) => r.chat_id === me);
 
   if (idx >= 0) {
-    // включим подписку в колонке F, не трогая is_admin (E)
     await sheets.spreadsheets.values.update({
-      spreadsheetId: SETTINGS_SHEET_ID,
+      spreadsheetId: SHEET_ID,
       range: `${SETTINGS_SHEET}!F${idx + 2}`,
       valueInputOption: "RAW",
       requestBody: { values: [["TRUE"]] },
@@ -100,9 +91,9 @@ async function upsertSub(chatId, username = "") {
     return;
   }
 
-  // добавим новую строку в основной Settings: chat_id, username, -, -, -, subscribed=TRUE
+  // chat_id | username | - | - | - | subscribed=TRUE
   await sheets.spreadsheets.values.append({
-    spreadsheetId: SETTINGS_SHEET_ID,
+    spreadsheetId: SHEET_ID,
     range: `${SETTINGS_SHEET}!A:F`,
     valueInputOption: "RAW",
     insertDataOption: "INSERT_ROWS",
@@ -111,7 +102,7 @@ async function upsertSub(chatId, username = "") {
   mem.delete("settings");
 }
 
-/** Отписаться: ставим F=FALSE */
+/** Отписаться: ставим F=FALSE (если нет колонки — просто игнор) */
 async function removeSub(chatId) {
   const all = await readSettings();
   const me = String(chatId);
@@ -119,7 +110,7 @@ async function removeSub(chatId) {
   if (idx < 0) return;
 
   await sheets.spreadsheets.values.update({
-    spreadsheetId: SETTINGS_SHEET_ID,
+    spreadsheetId: SHEET_ID,
     range: `${SETTINGS_SHEET}!F${idx + 2}`,
     valueInputOption: "RAW",
     requestBody: { values: [["FALSE"]] },
@@ -127,26 +118,31 @@ async function removeSub(chatId) {
   mem.delete("settings");
 }
 
-/* ===== Быстрые метрики / текст статуса (из карточной таблицы) ===== */
+/* ===== Быстрые метрики / текст статуса ===== */
 const MAIN_SHEET   = SHEET_NAMES.main   || "Основные карты";
 const BUFFER_SHEET = SHEET_NAMES.buffer || "Буферные карты";
 
-async function quickStats() {
+/**
+ * Быстрая сводка. При force=true читаем таблицу напрямую (без кеша).
+ */
+async function quickStats(force = false) {
   const cacheKey = "quick";
-  const c = getMem(cacheKey);
-  if (c) return c;
+  if (!force) {
+    const c = getMem(cacheKey);
+    if (c) return c;
+  }
 
   // Основные: D "Слоты всего", E "Слоты занято", G "Холды $", I "Статус"
   const mainRes = await sheets.spreadsheets.values.get({
-    spreadsheetId: CARDS_SHEET_ID,
+    spreadsheetId: SHEET_ID,
     range: `${MAIN_SHEET}!A2:K`,
   });
   const main = mainRes.data.values || [];
 
   let totalSlots = 0;
-  let usedSlots = 0;
-  let holds = 0;
-  let reissue = 0;
+  let usedSlots  = 0;
+  let holds      = 0;
+  let reissue    = 0;
 
   for (const r of main) {
     const dTotal = Number(r[3] || 0); // D
@@ -163,7 +159,7 @@ async function quickStats() {
 
   // Буферные: E "Статус" => Свободна
   const bufRes = await sheets.spreadsheets.values.get({
-    spreadsheetId: CARDS_SHEET_ID,
+    spreadsheetId: SHEET_ID,
     range: `${BUFFER_SHEET}!A2:G`,
   });
   const buf = bufRes.data.values || [];
@@ -174,23 +170,21 @@ async function quickStats() {
   }
 
   const out = { freeSlots, freeBuffer, holds, reissue };
-  setMem(cacheKey, out, 60_000);
+  if (!force) setMem(cacheKey, out, 60_000);
   return out;
 }
 
-async function computeStatusText() {
-  const { freeSlots, freeBuffer, holds, reissue } = await quickStats();
+async function computeStatusText(force = false) {
+  const { freeSlots, freeBuffer, holds, reissue } = await quickStats(force);
 
   const warnParts = [];
   if (freeSlots < 3)  warnParts.push(`Мало свободных слотов: ${freeSlots} (< 3)`);
   if (freeBuffer < 5) warnParts.push(`Мало свободных буферок: ${freeBuffer} (< 5)`);
 
   const warnLine = warnParts.length ? `\n⚠️ ${warnParts.join(" | ")}` : "";
-
-  const tips =
-    freeSlots === 0 && freeBuffer === 0 && holds === 0
-      ? "\nℹ️ Таблица пустая — считаю нули. Можно начинать заполнять листы."
-      : "";
+  const tips = (freeSlots === 0 && freeBuffer === 0 && holds === 0)
+    ? "\nℹ️ Таблица пустая — считаю нули. Можно начинать заполнять листы."
+    : "";
 
   return [
     "📊 *Статус карт*",
@@ -199,56 +193,52 @@ async function computeStatusText() {
     `Зависшие холды: *$${holds.toFixed(2)}*`,
     `Карт к перевыпуску: *${reissue}*`,
     warnLine,
-    tips,
+    tips
   ].join("\n");
 }
 
 /* ===== Меню и обработчики ===== */
-
-// «Заглушка»-кнопка для разделителя
-const dividerBtn = Markup.button.callback("🔒 Только для админов", "cards:noop");
-
-async function buildMenuFor(ctx) {
-  const commonRows = [
-    [Markup.button.callback("📊 Статус", "cards:status")],
-    [
-      Markup.button.callback("🔔 Подписаться", "cards:sub"),
-      Markup.button.callback("🔕 Отписаться", "cards:unsub"),
-    ],
-    [
-      Markup.button.callback("🧩 Слоты", "cards:slots"),
-      Markup.button.callback("🧩 Буферки", "cards:buffers"),
-      Markup.button.callback("🧩 Перевыпуск", "cards:reissue"),
-    ],
-    [Markup.button.callback("⬅️ Закрыть", "cards:close")],
-  ];
-
-  if (await isAdmin(ctx.chat.id)) {
-    // отдельная строка для админов + их кнопки
-    commonRows.splice(3, 0, [dividerBtn]);
-    commonRows.splice(4, 0, [Markup.button.callback("⚡ Проверить сейчас", "cards:checknow")]);
-  }
-
-  return Markup.inlineKeyboard(commonRows);
-}
-
 export function registerCardFlow(bot) {
+  const baseMenu = () =>
+    Markup.inlineKeyboard([
+      [Markup.button.callback("📊 Статус", "cards:status")],
+      [Markup.button.callback("🔔 Подписаться", "cards:sub"), Markup.button.callback("🔕 Отписаться", "cards:unsub")],
+      [Markup.button.callback("🧩 Слоты", "cards:slots"), Markup.button.callback("🧩 Буферки", "cards:buffers"), Markup.button.callback("🧩 Перевыпуск", "cards:reissue")],
+      [Markup.button.callback("🛠 Только для админов", "cards:admin")],
+      [Markup.button.callback("⬅️ Закрыть", "cards:close")],
+    ]);
+
+  const adminMenu = () =>
+    Markup.inlineKeyboard([
+      [Markup.button.callback("📊 Статус", "cards:status")],
+      [Markup.button.callback("⚡ Проверить сейчас", "cards:checknow")],
+      [Markup.button.callback("🧩 Слоты", "cards:slots"), Markup.button.callback("🧩 Буферки", "cards:buffers"), Markup.button.callback("🧩 Перевыпуск", "cards:reissue")],
+      [Markup.button.callback("⬅️ Закрыть", "cards:close")],
+    ]);
+
   // Главная кнопка «Карты»
   bot.hears("💳 Карты", async (ctx) => {
-    const kb = await buildMenuFor(ctx);
-    await ctx.reply("Выбери действие по картам:", kb);
+    await ctx.reply("Выбери действие по картам:", baseMenu());
   });
 
-  // Статус
+  // Разворачиваем «только для админов» в отдельную строку
+  bot.action("cards:admin", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (await isAdmin(ctx.chat.id)) {
+      await ctx.reply("Только для админов.", adminMenu());
+    } else {
+      await ctx.reply("Недоступно: вы не админ.");
+    }
+  });
+
+  // Статус — всегда свежие данные
   bot.action("cards:status", async (ctx) => {
     await ctx.answerCbQuery();
-    const text = await computeStatusText();
+    const text = await computeStatusText(true); // force
     try {
-      const kb = await buildMenuFor(ctx);
-      await ctx.editMessageText(text, { parse_mode: "Markdown", ...kb });
+      await ctx.editMessageText(text, { parse_mode: "Markdown", ...baseMenu() });
     } catch {
-      const kb = await buildMenuFor(ctx);
-      await ctx.reply(text, { parse_mode: "Markdown", ...kb });
+      await ctx.reply(text, { parse_mode: "Markdown", ...baseMenu() });
     }
   });
 
@@ -256,25 +246,22 @@ export function registerCardFlow(bot) {
   bot.action("cards:sub", async (ctx) => {
     await ctx.answerCbQuery();
     await upsertSub(ctx.chat.id, ctx.from?.username || "");
-    const kb = await buildMenuFor(ctx);
-    await ctx.reply("Подписал на автоуведомления ✅", kb);
+    await ctx.reply("Подписал на автоуведомления ✅", baseMenu());
   });
 
   bot.action("cards:unsub", async (ctx) => {
     await ctx.answerCbQuery();
     await removeSub(ctx.chat.id);
-    const kb = await buildMenuFor(ctx);
-    await ctx.reply("Отписал от автоуведомлений ✅", kb);
+    await ctx.reply("Отписал от автоуведомлений ✅", baseMenu());
   });
 
-  // Ручная рассылка — только админам
+  // Ручная рассылка — только админам, и только свежие цифры
   bot.action("cards:checknow", async (ctx) => {
     await ctx.answerCbQuery();
     if (!(await isAdmin(ctx.chat.id))) {
-      const kb = await buildMenuFor(ctx);
-      return ctx.reply("Только для админов.", kb);
+      return ctx.reply("Только для админов.", baseMenu());
     }
-    const text = await computeStatusText();
+    const text = await computeStatusText(true); // force
     const subs = await listSubs();
     for (const s of subs) {
       try {
@@ -283,35 +270,29 @@ export function registerCardFlow(bot) {
         console.error("auto send fail", s.chat_id, e?.message || e);
       }
     }
-    const kb = await buildMenuFor(ctx);
-    await ctx.reply("Разослал ✅", kb);
+    await ctx.reply("Разослал ✅", baseMenu());
   });
 
-  // Быстрые метрики
+  // Быстрые метрики (тоже актуальные)
   bot.action("cards:slots", async (ctx) => {
     await ctx.answerCbQuery();
-    const { freeSlots } = await quickStats();
+    const { freeSlots } = await quickStats(true);
     await ctx.reply(`Свободные слоты: *${freeSlots}*`, { parse_mode: "Markdown" });
   });
   bot.action("cards:buffers", async (ctx) => {
     await ctx.answerCbQuery();
-    const { freeBuffer } = await quickStats();
+    const { freeBuffer } = await quickStats(true);
     await ctx.reply(`Свободные буферки: *${freeBuffer}*`, { parse_mode: "Markdown" });
   });
   bot.action("cards:reissue", async (ctx) => {
     await ctx.answerCbQuery();
-    const { reissue } = await quickStats();
+    const { reissue } = await quickStats(true);
     await ctx.reply(`Карт к перевыпуску: *${reissue}*`, { parse_mode: "Markdown" });
   });
 
-  // Разделитель
-  bot.action("cards:noop", async (ctx) => ctx.answerCbQuery("Для админов"));
-
   bot.action("cards:close", async (ctx) => {
     await ctx.answerCbQuery();
-    try {
-      await ctx.editMessageText("Меню закрыто.");
-    } catch {}
+    try { await ctx.editMessageText("Меню закрыто."); } catch {}
   });
 
   /* ===== Автоуведомления по расписанию =====
@@ -320,7 +301,7 @@ export function registerCardFlow(bot) {
 
   nodeSchedule.scheduleJob(CRON_RULE_UTC, async () => {
     try {
-      const text = await computeStatusText();
+      const text = await computeStatusText(true); // force
       const subs = await listSubs();
       for (const s of subs) {
         try {
