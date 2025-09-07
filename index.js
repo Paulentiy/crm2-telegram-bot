@@ -5,8 +5,6 @@ import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 import { google } from 'googleapis';
 import { registerCardFlow } from './cardFlow.js';
-import { attachStatsHandlers } from "./stats.js";
-
 
 // ===== ENV =====
 const {
@@ -20,13 +18,8 @@ if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 if (!SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
 if (!GOOGLE_SERVICE_ACCOUNT_B64) throw new Error('Missing GOOGLE_SERVICE_ACCOUNT_B64');
 
-
-const bot = new Telegraf(process.env.BOT_TOKEN);
-
-// регистрируем статистику
-attachStatsHandlers(bot);
-
-// ...остальные обработчики/меню/launch...
+// === единственный экземпляр бота (ВАЖНО!) ===
+const bot = new Telegraf(TELEGRAM_TOKEN, { handlerTimeout: 30_000 });
 
 // ===== Google Sheets auth =====
 const svc = JSON.parse(Buffer.from(GOOGLE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8'));
@@ -249,16 +242,15 @@ const startOfToday = ()=>{ const d=new Date(); d.setHours(0,0,0,0); return d; };
 const addDays      = (d,n)=>{ const x=new Date(d); x.setDate(x.getDate()+n); return x; };
 const startOfMonth = ()=>{ const d=new Date(); return new Date(d.getFullYear(), d.getMonth(), 1); };
 
-// ===== Bot =====
-const bot = new Telegraf(TELEGRAM_TOKEN, { handlerTimeout: 30000 });
+// ===== Bot wiring =====
 
-// Подключаем модуль «Карты» (кнопки и автоуведомления)
+// модуль «Карты»
 registerCardFlow(bot);
 
-// Логи входящих текстов (удобно для дебага)
+// Логи входящих текстов (для дебага)
 bot.on('text', (ctx, next) => { console.log('TEXT:', ctx.message.text); return next(); });
 
-// Анти-дубли по update_id (на всякий случай)
+// Анти-дубли по update_id
 const seen=new Map(); const seenTTL=10*60*1000;
 setInterval(()=>{ const now=Date.now(); for(const [k,t] of seen){ if(now-t>seenTTL) seen.delete(k); }},60000);
 bot.use((ctx,next)=>{ const id=ctx.update?.update_id; if(id!=null){ if(seen.has(id)) return; seen.set(id,Date.now()); } return next(); });
@@ -417,14 +409,14 @@ const PORT = process.env.PORT || 3000;
     } else {
       // === long polling ===
       await bot.launch({
-        dropPendingUpdates: true,               // ещё раз гарантируем сброс очереди
-        allowedUpdates: ['message','callback_query'] // (не обязательно, но аккуратнее)
+        dropPendingUpdates: true,
+        allowedUpdates: ['message','callback_query']
       });
       app.listen(PORT, () => console.log('Bot via long polling on', PORT));
     }
   } catch (e) {
     console.error('Bot start error:', e);
-    process.exit(1); // пусть Railway перезапустит
+    process.exit(1);
   }
 
   process.once('SIGINT', () => bot.stop('SIGINT'));
