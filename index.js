@@ -213,27 +213,45 @@ async function undoLastForUser(userId){
 
 // ===== Stats (расходы) =====
 async function loadExpensesAtoG(){
-  const res=await sheets.spreadsheets.values.get({
-    spreadsheetId:SPREADSHEET_ID, range:`${SHEET_EXPENSES}!A2:G`
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_EXPENSES}!A2:G`,
+    valueRenderOption: 'UNFORMATTED_VALUE',   // <— важно
+    dateTimeRenderOption: 'FORMATTED_STRING'
   });
-  return res.data.values||[];
+  return res.data.values || [];
 }
-function parseDateCell(s){
-  const m=String(s||'').match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-  if(m){
-    const d=new Date(+m[3],+m[2]-1,+m[1]);
-    return isNaN(d.getTime())?null:d;
+
+function parseMoney(v){
+  if (typeof v === 'number') return v;
+  const s = String(v ?? '').replace(/\s/g, '').replace(/[^\d.,-]/g, '');
+  if (!s) return 0;
+  // если встречаются и точки, и запятые — считаем, что запятая = десятичный разделитель
+  const norm = (s.match(/,/g) || []).length > 1
+    ? s.replace(/\./g, '').replace(',', '.')
+    : s.replace(',', '.');
+  const n = parseFloat(norm);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function parseDateCell(v){
+  if (v == null) return null;
+  if (typeof v === 'number') {              // сериал Google Sheets
+    const ms = Math.round((v - 25569) * 86400 * 1000);
+    const d = new Date(ms); d.setHours(0,0,0,0); return d;
   }
-  const d=new Date(s);
-  return isNaN(d.getTime())?null:d;
+  const m = String(v).match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (m) { const d = new Date(+m[3], +m[2]-1, +m[1]); d.setHours(0,0,0,0); return d; }
+  const d = new Date(v); if (isNaN(d)) return null; d.setHours(0,0,0,0); return d;
 }
+
 async function sumUSD(start,end){
   const rows=await loadExpensesAtoG();
   let sum=0;
   for(const r of rows){
     const d=parseDateCell(r[0]); if(!d) continue;
     if(d<start || d>=end) continue;
-    const usd=Number(String(r[6]||'').replace(',','.'));
+    const usd = parseMoney(r[6]);
     if(usd>0) sum+=usd;
   }
   return sum;
