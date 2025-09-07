@@ -5,6 +5,8 @@ import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 import { google } from 'googleapis';
 import { registerCardFlow } from './cardFlow.js';
+import { attachStatsHandlers } from "./stats.js";
+
 
 // ===== ENV =====
 const {
@@ -17,6 +19,14 @@ const {
 if (!TELEGRAM_TOKEN) throw new Error('Missing TELEGRAM_TOKEN');
 if (!SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID');
 if (!GOOGLE_SERVICE_ACCOUNT_B64) throw new Error('Missing GOOGLE_SERVICE_ACCOUNT_B64');
+
+
+const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// регистрируем статистику
+attachStatsHandlers(bot);
+
+// ...остальные обработчики/меню/launch...
 
 // ===== Google Sheets auth =====
 const svc = JSON.parse(Buffer.from(GOOGLE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8'));
